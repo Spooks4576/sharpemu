@@ -656,7 +656,12 @@ public sealed partial class DirectExecutionBackend
 			"rqwFKI4PAiM" or
 			"eE4Szl8sil8" or
 			"qvMUCyyaCSI" or
+			"Vo5V8KAwCmk" or // sceSystemServiceHideSplashScreen
+			"TywrFKCoLGY" or // sceSaveDataInitialize3
+			"dyIhnXq-0SM" or // sceSaveDataDirNameSearch
 			"27bAgiJmOh0" or // pthread_cond_timedwait
+			"iQw3iQPhvUQ" or // sceNetCtlCheckCallback
+			"Q2V+iqvjgC0" or // vsnprintf
 			"j4ViWNHEgww" or // strlen
 			"5jNubw4vlAA" or // strnlen
 			"LHMrG7e8G78" or // wcslen
