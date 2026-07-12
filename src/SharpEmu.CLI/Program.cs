@@ -90,6 +90,10 @@ internal static partial class Program
 
         Console.Error.WriteLine("[DEBUG] Creating runtime...");
 
+        SharpEmu.HLE.Diagnostics.StallDiagnostics.SyncObjectStateDumper = address =>
+            SharpEmu.Libs.Kernel.KernelPthreadExtendedCompatExports.DumpRwlockStateForStall(address)
+            ?? SharpEmu.Libs.Kernel.KernelPthreadCompatExports.DumpMutexStateForStall(address);
+
         using var runtime = SharpEmuRuntime.CreateDefault(runtimeOptions);
 
         OrbisGen2Result result;

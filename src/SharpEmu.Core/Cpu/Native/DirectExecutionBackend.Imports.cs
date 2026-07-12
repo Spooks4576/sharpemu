@@ -155,7 +155,7 @@ public sealed partial class DirectExecutionBackend
 			for (int i = 1; i <= 4; i++)
 			{
 				ulong num8 = *(ulong*)(argPackPtr + 96 + i * 8);
-				if (IsLikelyReturnAddress(num8))
+				if (IsLikelyRepairedImportReturnAddress(importStubEntry.Address, num8))
 				{
 					*(ulong*)(argPackPtr + 96) = num8;
 					num7 = num8;
@@ -267,7 +267,7 @@ public sealed partial class DirectExecutionBackend
 				Console.Error.Flush();
 			}
 		}
-		if (!flag0 && !isGuestWorker)
+		if (!flag0)
 		{
 			RecordRecentImportTrace(
 				num,
@@ -697,6 +697,9 @@ public sealed partial class DirectExecutionBackend
 		var expectedMutexTrylockBusy =
 			string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+		var expectedMkdirAlreadyExists =
+			string.Equals(nid, "1-LFLmRFxxM", StringComparison.Ordinal) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_ALREADY_EXISTS;
 		var expectedUserServiceNoEvent =
 			string.Equals(nid, "yH17Q6NWtVg", StringComparison.Ordinal) &&
 			resultValue == unchecked((int)0x80960007);
@@ -707,6 +710,7 @@ public sealed partial class DirectExecutionBackend
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
 			!expectedMutexTrylockBusy &&
+			!expectedMkdirAlreadyExists &&
 			!expectedUserServiceNoEvent &&
 			!expectedPrivacyInvalidParameter)
 		{
@@ -742,6 +746,73 @@ public sealed partial class DirectExecutionBackend
 			"1G3lF1Gg1k8" or // sceKernelOpen
 			"gEpBkcwxUjw";   // sceKernelAprResolveFilepathsToIdsAndFileSizes
 
+	private static bool IsLikelyRepairedImportReturnAddress(ulong importStubAddress, ulong returnAddress)
+	{
+		if (!IsLikelyReturnAddress(returnAddress))
+		{
+			return false;
+		}
+
+		if (TryReadByte(returnAddress - 5, out var relCallOpcode) &&
+			relCallOpcode == 0xE8 &&
+			TryReadInt32(returnAddress - 4, out var rel32))
+		{
+			var target = unchecked(returnAddress + (ulong)(long)rel32);
+			if (target == importStubAddress)
+			{
+				return true;
+			}
+		}
+
+		if (TryReadByte(returnAddress - 2, out var ffOpcode) &&
+			TryReadByte(returnAddress - 1, out var modrm) &&
+			ffOpcode == 0xFF &&
+			(modrm & 0x38) == 0x10)
+		{
+			return true;
+		}
+
+		if (TryReadByte(returnAddress - 3, out var rexPrefix) &&
+			TryReadByte(returnAddress - 2, out ffOpcode) &&
+			TryReadByte(returnAddress - 1, out modrm) &&
+			(rexPrefix & 0xF0) == 0x40 &&
+			ffOpcode == 0xFF &&
+			(modrm & 0x38) == 0x10)
+		{
+			return true;
+		}
+
+		return false;
+	}
+
+	private unsafe static bool TryReadByte(ulong address, out byte value)
+	{
+		try
+		{
+			value = *(byte*)address;
+			return true;
+		}
+		catch
+		{
+			value = 0;
+			return false;
+		}
+	}
+
+	private unsafe static bool TryReadInt32(ulong address, out int value)
+	{
+		try
+		{
+			value = *(int*)address;
+			return true;
+		}
+		catch
+		{
+			value = 0;
+			return false;
+		}
+	}
+
 	// LEAF-IMPORT REGISTRATION — scalar-only constraint.
 	//
 	// TryDispatchLeafImport is a fast path that never copies the trampoline's XMM
@@ -769,10 +840,6 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		return nid is
-			"9UK1vLZQft4" or // scePthreadMutexLock
-			"tn3VlD0hG60" or // scePthreadMutexUnlock
-			"7H0iTOciTLo" or // pthread_mutex_lock
-			"2Z+PpY6CaJg" or // pthread_mutex_unlock
 			"8aI7R7WaOlc" or // sceAmprCommandBufferConstructor
 			"zgXifHT9ErY" or // sceVideoOutIsFlipPending
 			"V++UgBtQhn0" or // sceAgcGetDataPacketPayloadAddress

@@ -60,8 +60,6 @@ public static class AgcExports
     private const uint SpiShaderPgmHiEs = 0xC9;
     private const uint SpiShaderPgmLoLs = 0x148;
     private const uint SpiShaderPgmHiLs = 0x149;
-    private const uint SpiShaderPgmLoGs = 0x8A;
-    private const uint SpiShaderPgmHiGs = 0x8B;
     private const uint SpiPsInputEna = 0x1B3;
     private const uint SpiPsInputAddr = 0x1B4;
     private const uint ComputePgmLo = 0x20C;
@@ -2030,6 +2028,7 @@ public static class AgcExports
             Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"), "1", StringComparison.Ordinal);
 
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
+        ulong lastCommandAddress = 0;
         lock (gpuState.Gate)
         {
             for (uint i = 0; i < bufferCount; i++)
@@ -2050,6 +2049,7 @@ public static class AgcExports
                 }
 
                 ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
+                lastCommandAddress = commandAddress;
             }
 
             DrainResumableDcbs(ctx, gpuState, tracePackets);
@@ -2057,7 +2057,7 @@ public static class AgcExports
 
         var triggeredEvents = KernelEventQueueCompatExports.TriggerRegisteredEventsByFilter(
             KernelEventQueueCompatExports.KernelEventFilterGraphics,
-            commandAddress);
+            lastCommandAddress);
         TraceAgc($"agc.driver_submit_dcb_complete events={triggeredEvents}");
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;

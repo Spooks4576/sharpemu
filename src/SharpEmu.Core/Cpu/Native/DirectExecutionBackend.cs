@@ -2626,11 +2626,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			return;
 		}
-		if (_guestThreadPumpDepth != 0)
+		if (Interlocked.CompareExchange(ref _guestThreadPumpDepth, 1, 0) != 0)
 		{
 			return;
 		}
-		_guestThreadPumpDepth++;
 		try
 		{
 			for (int i = 0; i < 8; i++)
@@ -2676,7 +2675,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		finally
 		{
-			_guestThreadPumpDepth--;
+			Volatile.Write(ref _guestThreadPumpDepth, 0);
 		}
 	}
 
@@ -2719,9 +2718,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 
-		if (wakeCount != 0 && _logGuestThreads)
+		if (wakeCount != 0)
 		{
-			Console.Error.WriteLine($"[LOADER][INFO] guest_threads.wake key={wakeKey} count={wakeCount}");
+			if (_logGuestThreads)
+			{
+				Console.Error.WriteLine($"[LOADER][INFO] guest_threads.wake key={wakeKey} count={wakeCount}");
+			}
+
+			if (_cpuContext is { } wakeContext)
+			{
+				Pump(wakeContext, "wake");
+			}
 		}
 
 		return wakeCount;
@@ -4203,6 +4210,23 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return;
 		}
 		_stallWatchdogStop = false;
+		var dispatcherThread = new Thread(new ThreadStart(delegate
+		{
+			while (!_stallWatchdogStop)
+			{
+				Thread.Sleep(1);
+				WakeExpiredBlockedGuestThreads();
+				if (Volatile.Read(ref _readyGuestThreadCount) > 0 && _cpuContext is { } dispatchContext)
+				{
+					Pump(dispatchContext, "dispatcher");
+				}
+			}
+		}))
+		{
+			IsBackground = true,
+			Name = "SharpEmu-GuestThreadDispatcher"
+		};
+		dispatcherThread.Start();
 		long num = (long)((double)stallWatchdogSeconds * Stopwatch.Frequency);
 		_stallWatchdogThread = new Thread(new ThreadStart(delegate
 		{
@@ -4356,6 +4380,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				}
 				break;
 			}
+			if (SharpEmu.HLE.Diagnostics.StallDiagnostics.SyncObjectStateDumper is { } syncDumper &&
+				syncDumper(cpuContext[CpuRegister.Rdi]) is { } syncState)
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall sync-object: {syncState}");
+			}
 			Span<byte> destination = stackalloc byte[16];
 			if (cpuContext.Memory.TryRead(cpuContext.Rip, destination))
 			{
@@ -4394,7 +4423,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						$"[LOADER][ERROR] Stall guest-thread: handle=0x{thread.ThreadHandle:X16} name='{thread.Name}' " +
 						$"state={thread.State} imports={Interlocked.Read(ref thread.ImportCount)} " +
 						$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
-						$"block={thread.BlockReason ?? "none"}{hostContextText}");
+						$"block={thread.BlockReason ?? "none"} wait_on={thread.BlockWakeKey ?? "none"}{hostContextText}");
+					if (thread.BlockWakeKey is { } waitKey &&
+						waitKey.LastIndexOf("0x", StringComparison.Ordinal) is var hexIndex && hexIndex >= 0 &&
+						ulong.TryParse(waitKey.AsSpan(hexIndex + 2), System.Globalization.NumberStyles.HexNumber, null, out var waitAddress) &&
+						SharpEmu.HLE.Diagnostics.StallDiagnostics.SyncObjectStateDumper is { } waitDumper &&
+						waitDumper(waitAddress) is { } waitState)
+					{
+						Console.Error.WriteLine($"[LOADER][ERROR] Stall guest-thread:     waits-on-object: {waitState}");
+					}
 					logged++;
 					if (logged >= 48 && threads.Length > logged)
 					{

@@ -52,8 +52,11 @@ public sealed partial class DirectExecutionBackend
 			var entry = _recentImportTrace[num2];
 			if (!string.IsNullOrEmpty(entry.Nid))
 			{
+				var exportText = _moduleManager.TryGetExport(entry.Nid, out var export)
+					? $"{export.LibraryName}:{export.Name}"
+					: "<unresolved>";
 				Log.Info(
-					$"     #{entry.DispatchIndex} nid={entry.Nid} ret=0x{entry.ReturnRip:X16} " +
+					$"     #{entry.DispatchIndex} {exportText} nid={entry.Nid} ret=0x{entry.ReturnRip:X16} " +
 					$"rdi=0x{entry.Arg0:X16} rsi=0x{entry.Arg1:X16} rdx=0x{entry.Arg2:X16}");
 			}
 		}

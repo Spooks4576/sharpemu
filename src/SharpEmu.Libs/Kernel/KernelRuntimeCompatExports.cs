@@ -1112,14 +1112,19 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int StackCheckGuard(CpuContext ctx)
     {
-        var baseAddress = _stackChkGuardObjectAddress != 0
-            ? unchecked((ulong)_stackChkGuardObjectAddress)
-            : GetTlsScratchAddress(ctx, TlsStackChkGuardBaseOffset);
+        var tlsAddress = GetTlsScratchAddress(ctx, TlsStackChkGuardBaseOffset);
+        var baseAddress = tlsAddress != 0
+            ? tlsAddress
+            : (_stackChkGuardObjectAddress != 0
+                ? unchecked((ulong)_stackChkGuardObjectAddress)
+                : 0);
         if (baseAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        _ = ctx.TryWriteUInt64(baseAddress, _stackChkGuardValue);
+        _ = ctx.TryWriteUInt64(baseAddress + sizeof(ulong), _stackChkGuardValue);
         if (_stackChkGuardObjectAddress != 0)
         {
             try

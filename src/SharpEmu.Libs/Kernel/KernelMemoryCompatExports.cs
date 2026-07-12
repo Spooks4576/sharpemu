@@ -1848,9 +1848,19 @@ public static class KernelMemoryCompatExports
             }
 
             var parentDirectory = Path.GetDirectoryName(hostPath);
-            if (string.IsNullOrWhiteSpace(parentDirectory) || !Directory.Exists(parentDirectory))
+            if (string.IsNullOrWhiteSpace(parentDirectory))
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+            }
+
+            if (!Directory.Exists(parentDirectory))
+            {
+                if (!IsKnownWritableGuestPath(guestPath))
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+                }
+
+                Directory.CreateDirectory(parentDirectory);
             }
 
             Directory.CreateDirectory(hostPath);
@@ -1903,8 +1913,17 @@ public static class KernelMemoryCompatExports
         {
             if (!Directory.Exists(hostPath))
             {
+                if (!IsKnownWritableGuestPath(guestPath))
+                {
+                    AddNegativeStatCacheForGuestPath(guestPath);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+                }
+
+                InvalidateNegativeStatCacheForPathAndAncestors(guestPath);
                 AddNegativeStatCacheForGuestPath(guestPath);
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+                LogOpenTrace($"rmdir missing-ok path='{guestPath}' host='{hostPath}'");
+                ctx[CpuRegister.Rax] = 0;
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
 
             Directory.Delete(hostPath, recursive: false);
@@ -4756,6 +4775,22 @@ public static class KernelMemoryCompatExports
                  !IsApp0WritableOverlayPath(normalized)));
     }
 
+    private static bool IsKnownWritableGuestPath(string guestPath)
+    {
+        var normalized = NormalizeGuestStatCachePath(guestPath);
+        return normalized is not null &&
+               (string.Equals(normalized, "/temp0", StringComparison.OrdinalIgnoreCase) ||
+                normalized.StartsWith("/temp0/", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalized, "/download0", StringComparison.OrdinalIgnoreCase) ||
+                normalized.StartsWith("/download0/", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalized, "/devlog/app", StringComparison.OrdinalIgnoreCase) ||
+                normalized.StartsWith("/devlog/app/", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalized, "/hostapp", StringComparison.OrdinalIgnoreCase) ||
+                normalized.StartsWith("/hostapp/", StringComparison.OrdinalIgnoreCase) ||
+                (normalized.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase) &&
+                 IsApp0WritableOverlayPath(normalized)));
+    }
+
     private static bool IsApp0WritableOverlayPath(string normalizedGuestPath)
     {
         var relativePath = normalizedGuestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase)
@@ -5980,7 +6015,7 @@ public static class KernelMemoryCompatExports
 
             var alignedAddress = AlignUp(unchecked((ulong)baseAddress) + (ulong)pageSize, (ulong)effectiveAlignment);
             var guardAddress = alignedAddress + (ulong)usableSize;
-            if (!VirtualProtect((nint)guardAddress, pageSize, HostPageNoAccess, out _))
+            if (!ProtectHostMemory((nint)guardAddress, pageSize, HostPageNoAccess))
             {
                 _ = VirtualFree(baseAddress, 0, MemRelease);
                 return false;

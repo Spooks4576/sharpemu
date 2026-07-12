@@ -688,6 +688,12 @@ public sealed class SelfLoader : ISelfLoader
                 throw new InvalidDataException($"Failed to patch relocation at 0x{descriptor.TargetAddress:X16}.");
             }
 
+            if (descriptor.TargetAddress == 0x0000000808CEB0B8UL)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][PLT] slot=0x74 got=0x{descriptor.TargetAddress:X16} value=0x{targetValue:X16} addend=0x{descriptor.Addend:X} nid={(descriptor.ImportNid ?? "<sym>")}");
+            }
+
             if (descriptor.TargetAddress >= 0x00000008030FC300UL &&
                 descriptor.TargetAddress <= 0x00000008030FC3F0UL)
             {

@@ -128,11 +128,6 @@ public static class PlayGoExports
                 return OrbisPlayGoErrorNotInitialized;
             }
 
-            if (!_metadata.Available)
-            {
-                return OrbisPlayGoErrorNotSupportPlayGo;
-            }
-
             _opened = true;
             TracePlayGo($"open handle={PlayGoHandle} chunks={_metadata.ChunkIds.Length}");
         }

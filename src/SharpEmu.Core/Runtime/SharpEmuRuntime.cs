@@ -787,6 +787,11 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
     {
         foreach (var nid in HleDataSymbols.EnumerateKnownNids())
         {
+            if (IsTlsBackedHleDataSymbol(nid))
+            {
+                continue;
+            }
+
             if (runtimeSymbols.ContainsKey(nid) ||
                 !HleDataSymbols.TryGetAddress(nid, out var symbolAddress) ||
                 !IsUsableRuntimeSymbolAddress(symbolAddress))
@@ -797,6 +802,9 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             runtimeSymbols[nid] = symbolAddress;
         }
     }
+
+    private static bool IsTlsBackedHleDataSymbol(string nid) =>
+        string.Equals(nid, "f7uOxY9mM1U", StringComparison.Ordinal);
 
     private static int MergeImportStubs(
         IDictionary<ulong, string> destination,

@@ -133,7 +133,7 @@ public sealed unsafe partial class DirectExecutionBackend
 				backend.TryHandleLazyCommittedPage(&record, rip, rsp);
 			if (!handled)
 			{
-				backend.VectoredHandler(&pointers);
+				handled = backend.VectoredHandler(&pointers) == -1;
 			}
 
 			if (handled)

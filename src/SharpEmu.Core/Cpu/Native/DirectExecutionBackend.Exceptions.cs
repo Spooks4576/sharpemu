@@ -195,6 +195,7 @@ public sealed partial class DirectExecutionBackend
 				};
 				Console.Error.WriteLine("[LOADER][INFO]   AV access: " + accessText);
 				Console.Error.WriteLine($"[LOADER][INFO]   AV target: 0x{target:X16}");
+				DumpAccessViolationAddressHints(rip, target, rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8, r9, r10, r11, r12, r13, r14, r15);
 				if (VirtualQuery((void*)target, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0)
 				{
 					Console.Error.WriteLine($"[LOADER][INFO]   AV target region: base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} state=0x{mbi.State:X08} protect=0x{mbi.Protect:X08}");
@@ -387,6 +388,79 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine(
 				$"[LOADER][INFO]     0x{instruction.Rip:X16}: {instruction.Text} bytes={IcedDecoder.FormatBytes(instruction.Bytes)}");
 			rip += (ulong)instruction.Length;
+		}
+	}
+
+	private void DumpAccessViolationAddressHints(
+		ulong rip,
+		ulong target,
+		ulong rax,
+		ulong rbx,
+		ulong rcx,
+		ulong rdx,
+		ulong rsi,
+		ulong rdi,
+		ulong rbp,
+		ulong rsp,
+		ulong r8,
+		ulong r9,
+		ulong r10,
+		ulong r11,
+		ulong r12,
+		ulong r13,
+		ulong r14,
+		ulong r15)
+	{
+		if (_cpuContext == null ||
+			!IcedDecoder.TryReadGuestBytes(_cpuContext.Memory, rip, maxLen: 15, out var bytes) ||
+			!IcedDecoder.TryDecode(rip, bytes, out var instruction))
+		{
+			return;
+		}
+
+		Console.Error.WriteLine($"[LOADER][INFO]   Fault instruction: {instruction.Text} bytes={IcedDecoder.FormatBytes(instruction.Bytes)}");
+		var registers = new (string Name, ulong Value)[]
+		{
+			("rax", rax),
+			("rbx", rbx),
+			("rcx", rcx),
+			("rdx", rdx),
+			("rsi", rsi),
+			("rdi", rdi),
+			("rbp", rbp),
+			("rsp", rsp),
+			("r8", r8),
+			("r9", r9),
+			("r10", r10),
+			("r11", r11),
+			("r12", r12),
+			("r13", r13),
+			("r14", r14),
+			("r15", r15),
+		};
+
+		foreach (var register in registers)
+		{
+			if (register.Value == target)
+			{
+				Console.Error.WriteLine($"[LOADER][INFO]   AV target matches {register.Name}");
+			}
+		}
+
+		DumpAddressCandidate("rcx+r12", rcx, r12, target);
+		DumpAddressCandidate("rcx+r12+2", rcx + 2, r12, target);
+		DumpAddressCandidate("rdi+r12", rdi, r12, target);
+		DumpAddressCandidate("rsi+r12", rsi, r12, target);
+		DumpAddressCandidate("rdx+r12", rdx, r12, target);
+	}
+
+	private static void DumpAddressCandidate(string name, ulong baseValue, ulong indexValue, ulong target)
+	{
+		ulong value = unchecked(baseValue + indexValue);
+		ulong distance = value >= target ? value - target : target - value;
+		if (distance <= 0x100)
+		{
+			Console.Error.WriteLine($"[LOADER][INFO]   AV candidate {name}=0x{value:X16} (base=0x{baseValue:X16} index=0x{indexValue:X16})");
 		}
 	}
 
