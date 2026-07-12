@@ -53,12 +53,6 @@ public sealed partial class DirectExecutionBackend
 	{
 		WarmGuestThreadSensitiveRuntime();
 
-		if (!OperatingSystem.IsWindows())
-		{
-			InstallUnixSignalHandlers();
-			return;
-		}
-
 		if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_RAW_HANDLER"), "1", StringComparison.Ordinal))
 		{
 			_rawExceptionHandlerStub = CreateExceptionHandlerTrampoline(RawVectoredHandlerPtrManaged);
@@ -1142,15 +1136,6 @@ public sealed partial class DirectExecutionBackend
 				}
 				else if (TryReserveThenCommit(pageBase, 4096uL, pageBase, 4096uL, commitProtect))
 				{
-					committed = true;
-					committedBase = pageBase;
-					committedSize = 4096uL;
-				}
-				else if (!OperatingSystem.IsWindows() && TryCommitRange(pageBase, 4096uL, commitProtect))
-				{
-					// The reserve failed because the page is already mapped (the
-					// MEM_FREE query was stale); commit-in-place keeps its contents
-					// instead of replacing it with a zero page.
 					committed = true;
 					committedBase = pageBase;
 					committedSize = 4096uL;

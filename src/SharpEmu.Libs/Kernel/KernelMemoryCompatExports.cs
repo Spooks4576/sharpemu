@@ -154,9 +154,6 @@ public static class KernelMemoryCompatExports
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool WindowsVirtualProtect(nint lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect);
 
-    [DllImport("libc", SetLastError = true)]
-    private static extern int mprotect(nint addr, nuint len, int prot);
-
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern nint VirtualAlloc(nint lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
 
@@ -5704,25 +5701,8 @@ public static class KernelMemoryCompatExports
 
     private static bool ProtectHostMemory(nint address, nuint length, uint protection)
     {
-        if (OperatingSystem.IsWindows())
-        {
-            return WindowsVirtualProtect(address, length, protection, out _);
-        }
-
-        return mprotect(address, length, ToUnixProtection(protection)) == 0;
+        return WindowsVirtualProtect(address, length, protection, out _);
     }
-
-    private static int ToUnixProtection(uint protection) =>
-        protection switch
-        {
-            HostPageNoAccess => 0,
-            HostPageReadOnly => 1,
-            HostPageReadWrite => 1 | 2,
-            HostPageExecute => 4,
-            HostPageExecuteRead => 1 | 4,
-            HostPageExecuteReadWrite => 1 | 2 | 4,
-            _ => 1 | 2
-        };
 
     private static uint ResolveHostProtection(int orbisProtection)
     {
@@ -6393,23 +6373,6 @@ public static class KernelMemoryCompatExports
     {
         info = default;
 
-        if (!OperatingSystem.IsWindows())
-        {
-            // kernel32!VirtualQuery does not exist on Linux (crashed with
-            // "libkernel32.dll: cannot open shared object file"). Probe mapped-ness with msync:
-            // it returns ENOMEM(-1) for an unmapped range and 0 for a mapped one. Guest pages we
-            // hand out are read/write, so report RW when mapped.
-            var pageBase = (nint)(address & ~0xFFFUL);
-            if (msync(pageBase, 0x1000, MS_ASYNC) != 0)
-            {
-                return false;
-            }
-
-            info.State = MemCommit;
-            info.Protect = HostPageReadWrite;
-            return true;
-        }
-
         var size = (nuint)Marshal.SizeOf<MemoryBasicInformation>();
         if (VirtualQuery((nint)address, out info, size) == 0)
         {
@@ -6418,11 +6381,6 @@ public static class KernelMemoryCompatExports
 
         return info.State == MemCommit;
     }
-
-    private const int MS_ASYNC = 1;
-
-    [DllImport("libc", SetLastError = true)]
-    private static extern int msync(nint addr, nuint length, int flags);
 
     private static bool HasRequiredProtection(uint protect, bool writeAccess)
     {

@@ -17,7 +17,11 @@ public sealed unsafe class StubManager : IDisposable
 
     public StubManager()
     {
-        _pltMemory = (byte*)AllocateExecutableMemory((nuint)PltMemorySize);
+        _pltMemory = (byte*)VirtualAlloc(
+            null,
+            (nuint)PltMemorySize,
+            AllocationType.Reserve | AllocationType.Commit,
+            MemoryProtection.ExecuteReadWrite);
 
         if (_pltMemory == null)
         {
@@ -181,7 +185,7 @@ public sealed unsafe class StubManager : IDisposable
     {
         if (_pltMemory != null)
         {
-            FreeExecutableMemory(_pltMemory, (nuint)PltMemorySize);
+            VirtualFree(_pltMemory, 0, FreeType.Release);
             _pltMemory = null;
         }
 
@@ -190,48 +194,11 @@ public sealed unsafe class StubManager : IDisposable
         _stubAddresses.Clear();
     }
 
-    private static void* AllocateExecutableMemory(nuint size)
-    {
-        if (OperatingSystem.IsWindows())
-        {
-            return VirtualAlloc(
-                null,
-                size,
-                AllocationType.Reserve | AllocationType.Commit,
-                MemoryProtection.ExecuteReadWrite);
-        }
-
-        var result = mmap(null, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        return result == (void*)-1 ? null : result;
-    }
-
-    private static bool FreeExecutableMemory(void* address, nuint size)
-    {
-        if (OperatingSystem.IsWindows())
-        {
-            return VirtualFree(address, 0, FreeType.Release);
-        }
-
-        return munmap(address, size) == 0;
-    }
-
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern void* VirtualAlloc(void* lpAddress, nuint dwSize, AllocationType flAllocationType, MemoryProtection flProtect);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool VirtualFree(void* lpAddress, nuint dwSize, FreeType dwFreeType);
-
-    [DllImport("libc", SetLastError = true)]
-    private static extern void* mmap(void* addr, nuint length, int prot, int flags, int fd, nint offset);
-
-    [DllImport("libc", SetLastError = true)]
-    private static extern int munmap(void* addr, nuint length);
-
-    private const int PROT_READ = 0x1;
-    private const int PROT_WRITE = 0x2;
-    private const int PROT_EXEC = 0x4;
-    private const int MAP_PRIVATE = 0x02;
-    private const int MAP_ANONYMOUS = 0x20;
 
     [Flags]
     private enum AllocationType : uint
