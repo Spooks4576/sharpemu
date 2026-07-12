@@ -58,6 +58,31 @@ public static class NpEntitlementAccessExports
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
+    [SysAbiExport(
+        Nid = "lPDO62PpJIA",
+        ExportName = "sceNpEntitlementAccessGetSkuFlag",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpEntitlementAccess")]
+    public static int NpEntitlementAccessGetSkuFlag(CpuContext ctx)
+    {
+        var primaryOutAddress = ctx[CpuRegister.Rdi];
+        var secondaryOutAddress = ctx[CpuRegister.Rsi];
+
+        if (primaryOutAddress != 0 && !ctx.TryWriteUInt32(primaryOutAddress, 0))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (secondaryOutAddress != 0 && !ctx.TryWriteUInt32(secondaryOutAddress, 0))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceNpEntitlementAccess(
+            $"get_sku_flag out0=0x{primaryOutAddress:X16} out1=0x{secondaryOutAddress:X16} -> disabled");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
     private static void TraceNpEntitlementAccess(string message)
     {
         if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_NP"), "1", StringComparison.Ordinal))

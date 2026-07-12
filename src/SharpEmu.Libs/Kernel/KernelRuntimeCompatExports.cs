@@ -31,6 +31,8 @@ public static class KernelRuntimeCompatExports
     private const ulong TlsProcParamOffset = 0x100;
     private const ulong TlsMallocReplaceOffset = 0x200;
     private const ulong TlsNewReplaceOffset = 0x300;
+    private const ulong TlsArgvArrayOffset = 0x400;
+    private const ulong TlsArgvStringOffset = 0x440;
     private const int MallocReplaceSize = 0x70;
     private const int NewReplaceSize = 0x68;
     private const int OrbisTimesecSize = sizeof(long) + sizeof(uint) + sizeof(uint);
@@ -461,6 +463,54 @@ public static class KernelRuntimeCompatExports
         TraceProcParam(ctx, address);
 
         ctx[CpuRegister.Rax] = address;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "FJmglmTMdr4",
+        ExportName = "sceKernelGetArgv",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelGetArgv(CpuContext ctx)
+    {
+        var outArgcAddress = ctx[CpuRegister.Rdi];
+
+        var argvArrayAddress = GetTlsScratchAddress(ctx, TlsArgvArrayOffset);
+        var argvStringAddress = GetTlsScratchAddress(ctx, TlsArgvStringOffset);
+        if (argvArrayAddress == 0 || argvStringAddress == 0)
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        // A single argv[0] (the executable path); real titles only read the
+        // count and the program name from here.
+        Span<byte> argv0 = stackalloc byte[] { (byte)'/', (byte)'a', (byte)'p', (byte)'p', (byte)'0', (byte)'/', (byte)'e', (byte)'b', (byte)'o', (byte)'o', (byte)'t', (byte)'.', (byte)'b', (byte)'i', (byte)'n', 0 };
+        if (!ctx.Memory.TryWrite(argvStringAddress, argv0) ||
+            !ctx.TryWriteUInt64(argvArrayAddress + 0, argvStringAddress) ||
+            !ctx.TryWriteUInt64(argvArrayAddress + 8, 0))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        if (outArgcAddress != 0)
+        {
+            _ = ctx.TryWriteUInt32(outArgcAddress, 1);
+        }
+
+        ctx[CpuRegister.Rax] = argvArrayAddress;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "iKJMWrAumPE",
+        ExportName = "sceKernelGetArgc",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelGetArgc(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 1;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 

@@ -847,6 +847,8 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+    private static int _presentBlockTraceCount;
+
     private static bool TryTakePresentation(long presentedSequence, out Presentation presentation)
     {
         lock (_gate)
@@ -855,6 +857,24 @@ internal static unsafe class VulkanVideoPresenter
                 latest.Sequence == presentedSequence ||
                 latest.RequiredGuestWorkSequence > _completedGuestWorkSequence)
             {
+                if (Interlocked.Increment(ref _presentBlockTraceCount) is var n &&
+                    (n <= 5 || n % 2000 == 0))
+                {
+                    var reason = _latestPresentation is null
+                        ? "no-presentation"
+                        : _latestPresentation.Value.Sequence == presentedSequence
+                            ? "already-presented"
+                            : "waiting-guest-work";
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.present_blocked#{n} reason={reason} " +
+                        $"latest_seq={_latestPresentation?.Sequence.ToString() ?? "-"} " +
+                        $"presented_seq={presentedSequence} " +
+                        $"required_work={_latestPresentation?.RequiredGuestWorkSequence.ToString() ?? "-"} " +
+                        $"enqueued_work={_enqueuedGuestWorkSequence} " +
+                        $"completed_work={_completedGuestWorkSequence} " +
+                        $"pending={_pendingGuestWork.Count}");
+                }
+
                 presentation = default;
                 return false;
             }
@@ -5014,11 +5034,22 @@ internal static unsafe class VulkanVideoPresenter
                 _ => 0,
             };
 
-        private void Render(double _)
+        // vkQueuePresentKHR is the only thing throttling the window loop, so a RenderCore that
+        // presents nothing would otherwise spin the callback and peg a core. Yield instead.
+        private void Render(double delta)
+        {
+            var startedPresent = RenderCore(delta);
+            if (!startedPresent)
+            {
+                Thread.Sleep(1);
+            }
+        }
+
+        private bool RenderCore(double _)
         {
             if (!_vulkanReady)
             {
-                return;
+                return false;
             }
 
             _commandBuffer = _presentationCommandBuffer;
@@ -5053,7 +5084,7 @@ internal static unsafe class VulkanVideoPresenter
 
             if (!TryTakePresentation(_presentedSequence, out var presentation))
             {
-                return;
+                return false;
             }
 
             if (presentation.Pixels is null &&
@@ -5061,7 +5092,7 @@ internal static unsafe class VulkanVideoPresenter
                 presentation.TranslatedDraw is null &&
                 presentation.GuestImageAddress == 0)
             {
-                return;
+                return false;
             }
 
             byte[]? pixels = null;
@@ -5077,7 +5108,7 @@ internal static unsafe class VulkanVideoPresenter
                         _extent.Height);
                 if ((ulong)pixels.Length > _stagingSize)
                 {
-                    return;
+                    return false;
                 }
             }
 
@@ -5089,7 +5120,7 @@ internal static unsafe class VulkanVideoPresenter
                     out presentedGuestImage) ||
                  !presentedGuestImage.Initialized))
             {
-                return;
+                return false;
             }
             if (presentedGuestImage is not null)
             {
@@ -5133,7 +5164,7 @@ internal static unsafe class VulkanVideoPresenter
                     _presentedSequence = presentation.Sequence;
                     Console.Error.WriteLine(
                         $"[LOADER][ERROR] Vulkan VideoOut translated draw setup failed: {exception.Message}");
-                    return;
+                    return false;
                 }
             }
 
@@ -5153,7 +5184,7 @@ internal static unsafe class VulkanVideoPresenter
                     DestroyTranslatedDrawResources(translatedResources);
                 }
 
-                return;
+                return false;
             }
 
             CheckSwapchainResult(acquireResult, "vkAcquireNextImageKHR");
@@ -5265,7 +5296,7 @@ internal static unsafe class VulkanVideoPresenter
                 }
 
                 RecreateSwapchainResources("vkQueuePresentKHR", presentResult);
-                return;
+                return false;
             }
 
             CheckSwapchainResult(presentResult, "vkQueuePresentKHR");
@@ -5318,6 +5349,8 @@ internal static unsafe class VulkanVideoPresenter
             {
                 RecreateSwapchainResources("present suboptimal", Result.SuboptimalKhr);
             }
+
+            return true;
         }
 
         private void TraceGuestImageContents(GuestImageResource image)

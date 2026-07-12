@@ -694,9 +694,21 @@ public sealed partial class DirectExecutionBackend
 		var expectedEqueueTimeout =
 			string.Equals(nid, "fzyMKs9kim0", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
+		var expectedEventFlagTimeout =
+			string.Equals(nid, "JTvBflhYazQ", StringComparison.Ordinal) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
 		var expectedMutexTrylockBusy =
-			string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) &&
+			(string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) ||
+			 string.Equals(nid, "upoVrzMHFeE", StringComparison.Ordinal)) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+		var expectedMutexLockDeadlock =
+			(string.Equals(nid, "9UK1vLZQft4", StringComparison.Ordinal) ||
+			 string.Equals(nid, "7H0iTOciTLo", StringComparison.Ordinal)) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
+		var expectedMutexUnlockInvalid =
+			(string.Equals(nid, "tn3VlD0hG60", StringComparison.Ordinal) ||
+			 string.Equals(nid, "2Z+PpY6CaJg", StringComparison.Ordinal)) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
 		var expectedMkdirAlreadyExists =
 			string.Equals(nid, "1-LFLmRFxxM", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_ALREADY_EXISTS;
@@ -709,7 +721,10 @@ public sealed partial class DirectExecutionBackend
 		if (!expectedFileProbeMiss &&
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
+			!expectedEventFlagTimeout &&
 			!expectedMutexTrylockBusy &&
+			!expectedMutexLockDeadlock &&
+			!expectedMutexUnlockInvalid &&
 			!expectedMkdirAlreadyExists &&
 			!expectedUserServiceNoEvent &&
 			!expectedPrivacyInvalidParameter)

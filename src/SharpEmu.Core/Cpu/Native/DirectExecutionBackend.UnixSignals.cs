@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -9,8 +10,10 @@ namespace SharpEmu.Core.Cpu.Native;
 public sealed unsafe partial class DirectExecutionBackend
 {
 	private const int SIGILL = 4;
+	private const int SIGABRT = 6;
 	private const int SIGBUS = 7;
 	private const int SIGSEGV = 11;
+	private const int SIGURG = 23;
 	private const int SA_SIGINFO = 0x4;
 	private const uint EXCEPTION_ACCESS_VIOLATION = 0xC0000005u;
 	private const uint EXCEPTION_ILLEGAL_INSTRUCTION = 0xC000001Du;
@@ -34,6 +37,10 @@ public sealed unsafe partial class DirectExecutionBackend
 	private const int UnixRegRip = 16;
 	private const int UnixRegErr = 19;
 	private const int UnixRegCr2 = 22;
+
+	// Main guest executable is mapped at this base; IDA (which loads the ELF at its 0-based
+	// p_vaddr) address = guest RIP - this. Surfaced in crash dumps as module_offset.
+	private const ulong GuestModuleBaseForDiag = 0x800000000UL;
 
 	private static int _unixSignalHandlersInstalled;
 	private static readonly UnixSignalHandlerDelegate UnixSignalHandlerDelegateInstance = UnixSignalHandler;
@@ -64,24 +71,153 @@ public sealed unsafe partial class DirectExecutionBackend
 		InstallUnixSignalHandler(SIGSEGV);
 		InstallUnixSignalHandler(SIGBUS);
 		InstallUnixSignalHandler(SIGILL);
+		InstallUnixSignalHandler(SIGABRT);
+		InstallUnixSignalHandler(SIGURG);
 		Console.Error.WriteLine("[LOADER][INFO] Native Unix signal handlers installed.");
 	}
+
+	// coreclr's own handlers, saved at install time. The CLR converts hardware faults in
+	// managed code (null-reference reads, GC probes) into managed exceptions via its SIGSEGV
+	// handler; replacing it without chaining corrupts the runtime — any managed NRE then gets
+	// misrouted into the guest return stub and the process later dies with the misleading
+	// "UnmanagedCallersOnly" fail-fast or a SIGSEGV inside libcoreclr.
+	private static readonly UnixSigAction[] PreviousUnixSignalActions = new UnixSigAction[64];
 
 	private static void InstallUnixSignalHandler(int signal)
 	{
 		UnixSigAction action = default;
 		action.Handler = UnixSignalHandlerPtr;
 		action.Flags = SA_SIGINFO;
-		if (sigaction(signal, &action, null) != 0)
+		UnixSigAction previous = default;
+		if (sigaction(signal, &action, &previous) != 0)
 		{
 			Console.Error.WriteLine($"[LOADER][WARNING] sigaction({signal}) failed; native Unix fault recovery may be unavailable.");
+			return;
+		}
+
+		if ((uint)signal < (uint)PreviousUnixSignalActions.Length)
+		{
+			PreviousUnixSignalActions[signal] = previous;
 		}
 	}
 
+	private static bool TryChainPreviousUnixHandler(int signal, nint sigInfo, nint ucontext)
+	{
+		if ((uint)signal >= (uint)PreviousUnixSignalActions.Length)
+		{
+			return false;
+		}
+
+		var previous = PreviousUnixSignalActions[signal];
+		var handler = previous.Handler;
+		if (handler == 0 || handler == 1)
+		{
+			// SIG_DFL / SIG_IGN — nothing meaningful to chain to.
+			return false;
+		}
+
+		if ((previous.Flags & SA_SIGINFO) != 0)
+		{
+			((delegate* unmanaged[Cdecl]<int, nint, nint, void>)handler)(signal, sigInfo, ucontext);
+		}
+		else
+		{
+			((delegate* unmanaged[Cdecl]<int, void>)handler)(signal);
+		}
+
+		return true;
+	}
+
+	// Guest code lives at the module base (0x8_0000_0000) and in the vmem arena
+	// (0x10_0000_0000+); host JIT/CLR/libc code sits at 0x55…/0x7F… — far above.
+	private static bool IsGuestCodeRip(ulong rip) =>
+		rip >= 0x0000_0004_0000_0000UL && rip < 0x0000_5500_0000_0000UL;
+
+	// Context-sampling slots for TryCaptureUnixThreadContext: the watchdog sends SIGURG to a
+	// specific running guest thread via tgkill, and the handler copies that thread's ucontext
+	// registers here. Allocation-free by design — the sampled thread is normally executing
+	// raw guest code.
+	private static int _unixContextSampleGate;
+	private static int _unixContextSampleReady;
+	private static ulong _unixSampleRip;
+	private static ulong _unixSampleRsp;
+	private static ulong _unixSampleRbp;
+	private static ulong _unixSampleRax;
+	private static ulong _unixSampleRbx;
+	private static ulong _unixSampleRcx;
+	private static ulong _unixSampleRdx;
+
 	private static void UnixSignalHandler(int signal, nint sigInfo, nint ucontext)
 	{
+		if (signal == SIGURG)
+		{
+			if (ucontext != 0)
+			{
+				_unixSampleRip = ReadUnixCtxU64((void*)ucontext, UnixRegRip);
+				_unixSampleRsp = ReadUnixCtxU64((void*)ucontext, UnixRegRsp);
+				_unixSampleRbp = ReadUnixCtxU64((void*)ucontext, UnixRegRbp);
+				_unixSampleRax = ReadUnixCtxU64((void*)ucontext, UnixRegRax);
+				_unixSampleRbx = ReadUnixCtxU64((void*)ucontext, UnixRegRbx);
+				_unixSampleRcx = ReadUnixCtxU64((void*)ucontext, UnixRegRcx);
+				_unixSampleRdx = ReadUnixCtxU64((void*)ucontext, UnixRegRdx);
+				Volatile.Write(ref _unixContextSampleReady, 1);
+			}
+			return;
+		}
+
+		if (signal == SIGABRT)
+		{
+			if (_unixSignalDepth == 0)
+			{
+				_unixSignalDepth++;
+				try
+				{
+					var backend = _activeExecutionBackend;
+					if (backend is not null)
+					{
+						Console.Error.WriteLine("[LOADER][ERROR] SIGABRT caught (likely CLR heap-corruption fail-fast); dumping recent imports:");
+						backend.DumpRecentImportTrace();
+						Console.Error.Flush();
+					}
+				}
+				catch
+				{
+				}
+				finally
+				{
+					_unixSignalDepth--;
+				}
+			}
+
+			RestoreDefaultSignalActionAndReraise(signal);
+			return;
+		}
+
 		if (ucontext == 0 || _unixSignalDepth > 0)
 		{
+			// Unrecoverable: either no context, or a fault occurred while already handling one
+			// (nested/stack fault). We cannot safely recover, but capture the faulting RIP and
+			// fault address so the crash is not a black box (previously exited 139 with no RIP).
+			if (ucontext != 0)
+			{
+				var nestedRip = ReadUnixCtxU64((void*)ucontext, UnixRegRip);
+				var nestedTarget = signal == SIGILL ? nestedRip : ReadUnixCtxU64((void*)ucontext, UnixRegCr2);
+				if (nestedTarget == 0 && sigInfo != 0)
+				{
+					nestedTarget = (ulong)Marshal.ReadIntPtr(sigInfo + 16);
+				}
+				var moduleOffset = nestedRip >= GuestModuleBaseForDiag ? nestedRip - GuestModuleBaseForDiag : nestedRip;
+				try
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Unrecoverable signal {signal} (depth={_unixSignalDepth}) at RIP=0x{nestedRip:X16} " +
+						$"(module_offset=0x{moduleOffset:X}) target=0x{nestedTarget:X16} — not caught, terminating.");
+					Console.Error.Flush();
+				}
+				catch
+				{
+				}
+			}
 			RestoreDefaultSignalActionAndReraise(signal);
 			return;
 		}
@@ -92,7 +228,10 @@ public sealed unsafe partial class DirectExecutionBackend
 			var backend = _activeExecutionBackend;
 			if (backend is null)
 			{
-				RestoreDefaultSignalActionAndReraise(signal);
+				if (!TryChainPreviousUnixHandler(signal, sigInfo, ucontext))
+				{
+					RestoreDefaultSignalActionAndReraise(signal);
+				}
 				return;
 			}
 
@@ -139,6 +278,19 @@ public sealed unsafe partial class DirectExecutionBackend
 			if (handled)
 			{
 				ApplyWindowsContextToUnix(windowsContext, (void*)ucontext);
+				return;
+			}
+
+			if (!IsGuestCodeRip(rip))
+			{
+				// Fault in host/CLR code that isn't a guest lazy-commit touch: this is the
+				// runtime's fault to process (managed NRE, GC probe). Hand it back to the
+				// handler coreclr installed instead of hijacking a CLR thread into the
+				// guest return stub, which corrupts the runtime.
+				if (!TryChainPreviousUnixHandler(signal, sigInfo, ucontext))
+				{
+					RestoreDefaultSignalActionAndReraise(signal);
+				}
 				return;
 			}
 
@@ -214,6 +366,68 @@ public sealed unsafe partial class DirectExecutionBackend
 		_ = sigaction(signal, &action, null);
 		_ = raise(signal);
 	}
+
+	// Linux counterpart of the Windows SuspendThread/GetThreadContext capture: signal the
+	// target thread with SIGURG (via tgkill so only that thread receives it) and wait briefly
+	// for its handler to publish the interrupted register state. Only meaningful for threads
+	// currently executing guest code; the watchdog uses it to find where a spinning guest
+	// thread is stuck.
+	private static bool TryCaptureUnixThreadContext(int hostThreadId, out HostThreadContextSnapshot snapshot)
+	{
+		snapshot = default;
+		if (hostThreadId == 0 || hostThreadId == unchecked((int)GetCurrentThreadId()))
+		{
+			return false;
+		}
+
+		if (Interlocked.CompareExchange(ref _unixContextSampleGate, 1, 0) != 0)
+		{
+			return false;
+		}
+
+		try
+		{
+			Volatile.Write(ref _unixContextSampleReady, 0);
+			if (syscall(TgkillSyscallNumber, getpid(), hostThreadId, SIGURG) != 0)
+			{
+				return false;
+			}
+
+			var spinWatch = Stopwatch.GetTimestamp();
+			var timeoutTicks = Stopwatch.Frequency / 100; // 10ms
+			while (Volatile.Read(ref _unixContextSampleReady) == 0)
+			{
+				if (Stopwatch.GetTimestamp() - spinWatch > timeoutTicks)
+				{
+					return false;
+				}
+				Thread.SpinWait(64);
+			}
+
+			snapshot = new HostThreadContextSnapshot(
+				true,
+				_unixSampleRip,
+				_unixSampleRsp,
+				_unixSampleRbp,
+				_unixSampleRax,
+				_unixSampleRbx,
+				_unixSampleRcx,
+				_unixSampleRdx);
+			return true;
+		}
+		finally
+		{
+			Volatile.Write(ref _unixContextSampleGate, 0);
+		}
+	}
+
+	private const long TgkillSyscallNumber = 234;
+
+	[DllImport("libc", SetLastError = true)]
+	private static extern long syscall(long number, long arg1, long arg2, long arg3);
+
+	[DllImport("libc")]
+	private static extern int getpid();
 
 	[DllImport("libc", SetLastError = true)]
 	private static extern int sigaction(int signum, UnixSigAction* act, UnixSigAction* oldact);

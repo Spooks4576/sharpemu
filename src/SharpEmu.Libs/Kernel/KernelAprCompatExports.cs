@@ -80,11 +80,16 @@ public static class KernelAprCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
+        // The command buffer already completed synchronously (AmprExports.CompleteCommandBuffer
+        // at submit time), so the wait itself has succeeded. The result write is best-effort:
+        // the game sometimes passes a small non-pointer value in waitArg2 (observed 0xF) that the
+        // heuristic can misread as a result address, and writing there faults. That must NOT fail
+        // the wait — returning MEMORY_FAULT makes the guest retry the wait forever in a tight loop
+        // and never progress past GPU submission.
         var resultAddress = ResolveWaitResultAddress(waitArg1, waitArg2, submission.ResultAddress);
         if (resultAddress != 0 && !TryWriteAprResult(ctx, resultAddress))
         {
             TraceAprWaitFailure(ctx, "wait_result_fault", submissionId, submission.CommandBuffer, waitArg1, waitArg2);
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         TraceApr(ctx, "wait", submissionId, submission.CommandBuffer, waitArg1, resultAddress);

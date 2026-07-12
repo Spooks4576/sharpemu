@@ -52,6 +52,68 @@ public static class AgcExports
     private const uint RFlip = 0x17;
     private const uint RReleaseMem = 0x18;
     private const uint RDmaData = 0x19;
+
+    // Monotonic counter emitted for RELEASE_MEM DATA_SEL=3 (GPU timestamp) EOP fences.
+    private static ulong _gpuEopTimestamp;
+
+    // EOP fences are delivered on this host thread with a short delay instead of
+    // synchronously inside the submit import. On real hardware the end-of-pipe
+    // interrupt fires after the submitting thread has finished rotating its
+    // command-buffer chunks; signalling completion mid-submit lets the guest's
+    // chunk allocator recycle a chunk the submitter still holds (the null-vtable
+    // UAF at guest 0x2034C09). SHARPEMU_AGC_SYNC_EOP=1 restores the old behavior.
+    private sealed record PendingEopEvent(
+        CpuContext Ctx,
+        ulong DestinationAddress,
+        uint DataSelection,
+        uint DataLo,
+        ulong Data,
+        uint InterruptContextId,
+        uint Interrupt,
+        bool TracePacket);
+
+    private static readonly System.Collections.Concurrent.BlockingCollection<PendingEopEvent> _pendingEopEvents = new();
+    private static int _eopDeliveryThreadStarted;
+    private static readonly bool _synchronousEop =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_AGC_SYNC_EOP"), "1", StringComparison.Ordinal);
+
+    private static void EnsureEopDeliveryThread()
+    {
+        if (Interlocked.Exchange(ref _eopDeliveryThreadStarted, 1) != 0)
+        {
+            return;
+        }
+
+        var thread = new Thread(static () =>
+        {
+            foreach (var pending in _pendingEopEvents.GetConsumingEnumerable())
+            {
+                Thread.Sleep(1);
+                DeliverEopEventGuarded(pending);
+                while (_pendingEopEvents.TryTake(out var more))
+                {
+                    DeliverEopEventGuarded(more);
+                }
+            }
+
+            static void DeliverEopEventGuarded(PendingEopEvent pending)
+            {
+                try
+                {
+                    DeliverEopEvent(pending);
+                }
+                catch (Exception exception)
+                {
+                    Console.Error.WriteLine($"[LOADER][ERROR] AgcEopDelivery failed: {exception}");
+                }
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "AgcEopDelivery",
+        };
+        thread.Start();
+    }
     private const uint SpiShaderPgmLoPs = 0x8;
     private const uint SpiShaderPgmHiPs = 0x9;
     private const uint SpiShaderPgmLoGs = 0x8A;
@@ -2842,28 +2904,94 @@ public static class AgcExports
             !ctx.TryReadUInt32(packetAddress + 12, out var destinationLo) ||
             !ctx.TryReadUInt32(packetAddress + 16, out var destinationHi) ||
             !ctx.TryReadUInt32(packetAddress + 20, out var dataLo) ||
-            !ctx.TryReadUInt32(packetAddress + 24, out var dataHi))
+            !ctx.TryReadUInt32(packetAddress + 24, out var dataHi) ||
+            !ctx.TryReadUInt32(packetAddress + 28, out var interruptContextId))
         {
             return;
         }
 
         var dataSelection = (control >> 16) & 0xFFu;
+        var interrupt = (control >> 24) & 0xFFu;
         var destinationAddress = ((ulong)destinationHi << 32) | destinationLo;
         var data = ((ulong)dataHi << 32) | dataLo;
 
+        // The fence label MUST be written synchronously. Our command-buffer submit completes
+        // inside the submit import, so by the time it returns the guest may already be spinning
+        // on this label (often while holding a lock). Deferring the write wedges that spin.
+        // DATA_SEL=3 means "write the 64-bit GPU clock/timestamp", not the immediate data
+        // (which is 0 for EOP fences). Emit a monotonically increasing nonzero value so any
+        // CPU-side label poll that waits for the fence to advance is satisfied.
         var wroteData = dataSelection switch
         {
             1 => ctx.TryWriteUInt32(destinationAddress, dataLo),
-            2 or 3 => ctx.TryWriteUInt64(destinationAddress, data),
+            2 => ctx.TryWriteUInt64(destinationAddress, data),
+            3 => ctx.TryWriteUInt64(destinationAddress, Interlocked.Increment(ref _gpuEopTimestamp)),
             _ => false,
         };
 
+        var pending = new PendingEopEvent(
+            ctx,
+            destinationAddress,
+            dataSelection,
+            dataLo,
+            data,
+            interruptContextId,
+            interrupt,
+            tracePacket);
+
+        if (pending.Interrupt == 0)
+        {
+            if (tracePacket)
+            {
+                TraceReleaseMem(pending, wroteData, triggeredQueues: 0);
+            }
+
+            return;
+        }
+
+        // Only the INTERRUPT is deferred. On real hardware the end-of-pipe interrupt lands after
+        // the submitting thread has finished rotating its command-buffer chunks; raising it
+        // synchronously lets the guest's chunk allocator recycle a chunk the submitter still
+        // holds (the null-vtable UAF at guest 0x2034C09).
+        if (_synchronousEop)
+        {
+            DeliverEopEvent(pending);
+            return;
+        }
+
+        EnsureEopDeliveryThread();
+        _pendingEopEvents.Add(pending);
+
         if (tracePacket)
         {
-            TraceAgc(
-                $"agc.dcb.release_mem dst=0x{destinationAddress:X16} data_sel={dataSelection} " +
-                $"data=0x{data:X16} wrote={wroteData}");
+            TraceReleaseMem(pending, wroteData, triggeredQueues: -1);
         }
+    }
+
+    private static void DeliverEopEvent(PendingEopEvent pending)
+    {
+        // RELEASE_MEM with the interrupt bit set is the GPU end-of-pipe interrupt. On real
+        // hardware it wakes the driver's interrupt thread (here AgcInterruptThread, blocked on
+        // sceKernelWaitEqueue) via a graphics equeue event keyed by the interrupt context id
+        // registered through sceAgcDriverAddEqEvent. Without this the GPU-completion callback
+        // never runs and the game never submits a flip.
+        var triggeredQueues = KernelEventQueueCompatExports.TriggerRegisteredEvents(
+            pending.InterruptContextId,
+            KernelEventQueueCompatExports.KernelEventFilterGraphics,
+            pending.InterruptContextId);
+
+        if (pending.TracePacket)
+        {
+            TraceReleaseMem(pending, wroteData: true, triggeredQueues);
+        }
+    }
+
+    private static void TraceReleaseMem(PendingEopEvent pending, bool wroteData, int triggeredQueues)
+    {
+        TraceAgc(
+            $"agc.dcb.release_mem dst=0x{pending.DestinationAddress:X16} data_sel={pending.DataSelection} " +
+            $"data=0x{pending.Data:X16} wrote={wroteData} int={pending.Interrupt} " +
+            $"int_ctx=0x{pending.InterruptContextId:X} queues={(triggeredQueues < 0 ? "deferred" : triggeredQueues.ToString())}");
     }
 
     private static void ApplySubmittedRegisters(

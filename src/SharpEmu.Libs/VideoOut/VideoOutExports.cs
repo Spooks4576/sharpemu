@@ -45,6 +45,47 @@ public static class VideoOutExports
     private static readonly object _stateGate = new();
     private static readonly object _frameDumpGate = new();
     private static readonly Dictionary<int, VideoOutPortState> _ports = new();
+
+    // The display generates vblanks autonomously on real hardware; UE arms a
+    // vblank event and blocks its frame loop on it, so without an independent
+    // driver every render thread idles forever. This pump ticks all open ports
+    // at ~60 Hz to keep the frame clock running.
+    private static Timer? _vblankPumpTimer;
+    private const int VblankPumpIntervalMs = 16;
+
+    private static void EnsureVblankPumpStarted()
+    {
+        if (_vblankPumpTimer is not null)
+        {
+            return;
+        }
+
+        _vblankPumpTimer = new Timer(
+            static _ => PumpVblanks(),
+            null,
+            VblankPumpIntervalMs,
+            VblankPumpIntervalMs);
+    }
+
+    private static void PumpVblanks()
+    {
+        VideoOutPortState[] ports;
+        lock (_stateGate)
+        {
+            if (_ports.Count == 0)
+            {
+                return;
+            }
+
+            ports = new VideoOutPortState[_ports.Count];
+            _ports.Values.CopyTo(ports, 0);
+        }
+
+        foreach (var port in ports)
+        {
+            SignalVblank(port);
+        }
+    }
     private static readonly Dictionary<(int Handle, int BufferIndex, ulong Address), ulong> _lastFrameFingerprints = new();
     private static int _nextHandle = 1;
     private static int _frameDumpCount;
@@ -176,6 +217,7 @@ public static class VideoOutExports
             {
                 Handle = handle,
             };
+            EnsureVblankPumpStarted();
             return handle;
         }
     }

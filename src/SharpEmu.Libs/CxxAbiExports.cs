@@ -78,8 +78,17 @@ public static class CxaGuardExports
             {
                 if (state.OwnerThreadId == currentThreadId)
                 {
-                    ctx[CpuRegister.Rax] = 0;
-                    LogGuardResult("guard_acquire", guardPtr, result: 0, initialized, inProgress: true, ownerThreadId: state.OwnerThreadId);
+                    // Recursive acquire: this thread is already constructing this static and has
+                    // re-entered its own initializer. Returning 0 ("already done, use it") makes
+                    // the guest deref a still-null singleton; blindly returning 1 lets a pair of
+                    // mutually-referencing statics (E41E28<->E38CD0) construct each other forever
+                    // → 7700-deep stack overflow. Allow ONE re-entrant construction (which lets a
+                    // static that legitimately needs building on re-entry proceed), but break the
+                    // cycle after that by returning 0 so the recursion terminates.
+                    var depth = ++state.RecursionDepth;
+                    var doConstruct = depth <= 2;
+                    ctx[CpuRegister.Rax] = (ulong)(doConstruct ? 1 : 0);
+                    LogGuardResult("guard_acquire", guardPtr, result: doConstruct ? 1 : 0, initialized, inProgress: true, ownerThreadId: state.OwnerThreadId);
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 }
             }

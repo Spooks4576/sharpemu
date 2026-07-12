@@ -3,6 +3,7 @@
 
 using System.Collections.Concurrent;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 
 namespace SharpEmu.HLE;
 
@@ -12,6 +13,7 @@ public sealed class ModuleManager : IModuleManager
     private readonly ConcurrentDictionary<string, ExportedFunction> _exportTable = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ExportedFunction> _exportNameTable = new(StringComparer.Ordinal);
     private readonly object _registrationGate = new();
+    private readonly HashSet<(Assembly Assembly, Generation Generation)> _scannedAssemblies = new();
     private bool _isFrozen;
 
     public int RegisterFromAssembly(Assembly assembly, Generation generation, ISymbolCatalog? symbolCatalog = null)
@@ -23,6 +25,14 @@ public sealed class ModuleManager : IModuleManager
             if (_isFrozen)
             {
                 throw new InvalidOperationException("Module registration is frozen.");
+            }
+
+            // Callers reference the same assembly through different types
+            // (VideoOutExports and KernelExports both live in SharpEmu.Libs),
+            // so scanning is deduplicated to avoid spurious duplicate-NID skips.
+            if (!_scannedAssemblies.Add((assembly, generation)))
+            {
+                return 0;
             }
 
             var registeredCount = 0;
@@ -73,7 +83,206 @@ public sealed class ModuleManager : IModuleManager
         {
             _isFrozen = true;
         }
+
+        WarmHleTypeInitializers();
     }
+
+    // Guest threads dispatch HLE exports on a hijacked, non-CLR-owned stack. If a type's static
+    // constructor (.cctor) runs for the FIRST time in that context, the CLR fail-fasts with the
+    // misleading "Invalid Program: attempted to call a UnmanagedCallersOnly method from managed
+    // code" (observed crashing in PthreadRwlockState..ctor, which touched a nested static). Force
+    // every type in the HLE-bearing assemblies to run its static constructor now, once, on this
+    // host thread — so no guest thread is ever the first to initialize a type.
+    private void WarmHleTypeInitializers()
+    {
+        Assembly[] assemblies;
+        lock (_registrationGate)
+        {
+            assemblies = _scannedAssemblies.Select(entry => entry.Assembly).Distinct().ToArray();
+        }
+
+        assemblies = WithGuestReachableDependencies(assemblies);
+        var bclWarmed = WarmFrameworkTypeInitializers();
+
+        var warmed = 0;
+        var failed = 0;
+        var jitted = 0;
+        var jitFailed = 0;
+        foreach (var assembly in assemblies)
+        {
+            Type[] types;
+            try
+            {
+                types = assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                types = ex.Types.Where(t => t is not null).ToArray()!;
+            }
+
+            const BindingFlags allMembers = BindingFlags.Public | BindingFlags.NonPublic |
+                BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
+
+            foreach (var type in types)
+            {
+                if (type is null || type.ContainsGenericParameters)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    RuntimeHelpers.RunClassConstructor(type.TypeHandle);
+                    warmed++;
+                }
+                catch
+                {
+                    // A .cctor that throws here (on the host thread) is far better than one that
+                    // fail-fasts the whole CLR later on a guest thread; swallow and continue.
+                    failed++;
+                }
+
+                // Force-JIT every method and constructor so a guest thread is never the first to
+                // compile one. PrepareMethod only JITs — it does not execute — so this is
+                // side-effect-free (unlike instantiating types). This covers the crashing case:
+                // PthreadMutexState..ctor (which allocates a SemaphoreSlim) first-JIT'd on a
+                // guest thread fail-fasts the CLR with the misleading UnmanagedCallersOnly error.
+                MethodBase[] members;
+                try
+                {
+                    members = type.GetConstructors(allMembers)
+                        .Concat<MethodBase>(type.GetMethods(allMembers))
+                        .ToArray();
+                }
+                catch
+                {
+                    continue;
+                }
+
+                foreach (var member in members)
+                {
+                    if (member.ContainsGenericParameters || member.IsAbstract || member.MethodImplementationFlags.HasFlag(MethodImplAttributes.InternalCall))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        RuntimeHelpers.PrepareMethod(member.MethodHandle);
+                        jitted++;
+                    }
+                    catch
+                    {
+                        jitFailed++;
+                    }
+                }
+            }
+        }
+
+        Console.Error.WriteLine(
+            $"[HLE] Warmed {warmed} type initializers ({failed} threw) + JIT-compiled {jitted} methods ({jitFailed} skipped) across {assemblies.Length} HLE assemblies, plus {bclWarmed} framework type initializers.");
+    }
+
+    // The HLE reaches into the BCL, so run framework .cctors here too. Only .cctors — the BCL is
+    // far too large to force-JIT.
+    private static int WarmFrameworkTypeInitializers()
+    {
+        var warmed = 0;
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            var name = assembly.GetName().Name;
+            if (name is null || !IsFrameworkAssembly(name))
+            {
+                continue;
+            }
+
+            Type[] types;
+            try
+            {
+                types = assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                types = ex.Types.Where(t => t is not null).ToArray()!;
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var type in types)
+            {
+                if (type is null || type.ContainsGenericParameters)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    RuntimeHelpers.RunClassConstructor(type.TypeHandle);
+                    warmed++;
+                }
+                catch
+                {
+                    // Better to throw here, on a host thread, than to fail-fast later on a guest one.
+                }
+            }
+        }
+
+        return warmed;
+    }
+
+    private static bool IsFrameworkAssembly(string assemblyName) =>
+        assemblyName.StartsWith("System", StringComparison.Ordinal) ||
+        string.Equals(assemblyName, "netstandard", StringComparison.Ordinal);
+
+    // Guest threads reach Silk.NET through the flip path, so warm the interop assemblies too.
+    private static Assembly[] WithGuestReachableDependencies(Assembly[] scanned)
+    {
+        var result = new Dictionary<string, Assembly>(StringComparer.Ordinal);
+        foreach (var assembly in scanned)
+        {
+            result[assembly.FullName ?? assembly.GetName().Name ?? string.Empty] = assembly;
+        }
+
+        foreach (var assembly in scanned)
+        {
+            AssemblyName[] references;
+            try
+            {
+                references = assembly.GetReferencedAssemblies();
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var reference in references)
+            {
+                var name = reference.Name;
+                if (name is null || !IsGuestReachableInterop(name))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var loaded = Assembly.Load(reference);
+                    result[loaded.FullName ?? name] = loaded;
+                }
+                catch
+                {
+                    // A dependency we cannot load is one a guest thread cannot reach either.
+                }
+            }
+        }
+
+        return result.Values.ToArray();
+    }
+
+    private static bool IsGuestReachableInterop(string assemblyName) =>
+        assemblyName.StartsWith("Silk.NET", StringComparison.Ordinal) ||
+        assemblyName.StartsWith("SharpEmu", StringComparison.Ordinal);
 
     public bool TryGetFunction(string nid, out Delegate function)
     {

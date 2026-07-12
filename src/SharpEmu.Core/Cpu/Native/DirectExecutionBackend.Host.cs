@@ -166,30 +166,6 @@ public sealed unsafe partial class DirectExecutionBackend
 		return result;
 	}
 
-	private static void* VirtualAllocFixedReplace(void* address, nuint size, uint allocationType, uint protection)
-	{
-		if (OperatingSystem.IsWindows())
-		{
-			return WindowsVirtualAlloc(address, size, allocationType, protection);
-		}
-
-		if (address == null)
-		{
-			return null;
-		}
-
-		var alignedSize = (nuint)AlignUp((ulong)size, 0x1000);
-		var prot = (allocationType & MEM_COMMIT) != 0 ? ToUnixProtection(protection) : PROT_NONE;
-		var result = mmap(address, alignedSize, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-		if (result == (void*)-1 || result != address)
-		{
-			return null;
-		}
-
-		UnixAllocationSizes[(ulong)result] = alignedSize;
-		return result;
-	}
-
 	private static bool VirtualFree(void* address, nuint size, uint freeType)
 	{
 		if (OperatingSystem.IsWindows())
@@ -384,11 +360,44 @@ public sealed unsafe partial class DirectExecutionBackend
 	private static nuint QueryUnixRegionSize(ulong address) =>
 		TryQueryUnixMemory(address, out var info) ? (nuint)info.RegionSize : 0;
 
+	// Allocated eagerly from native memory: this buffer is used from the SIGSEGV
+	// handler, where the GC must not be involved at all (a GC allocation here crashed
+	// coreclr internals once the maps file outgrew a lazily grown buffer). 8MB fits
+	// ~100k mappings. Guarded by an Interlocked spin gate for the same reason — no
+	// managed blocking in signal context.
+	private const int UnixMapsBufferSize = 8 * 1024 * 1024;
+	private static readonly byte* UnixMapsBuffer = (byte*)NativeMemory.Alloc(UnixMapsBufferSize);
+	private static int _unixMapsGate;
+
 	private static bool TryQueryUnixMemory(ulong address, out MEMORY_BASIC_INFORMATION64 info)
 	{
+		while (Interlocked.CompareExchange(ref _unixMapsGate, 1, 0) != 0)
+		{
+			Thread.SpinWait(64);
+		}
+
+		try
+		{
+			return TryQueryUnixMemoryLocked(address, out info);
+		}
+		finally
+		{
+			Volatile.Write(ref _unixMapsGate, 0);
+		}
+	}
+
+	private static bool TryQueryUnixMemoryLocked(ulong address, out MEMORY_BASIC_INFORMATION64 info)
+	{
 		info = default;
-		var maps = GC.AllocateUninitializedArray<byte>(128 * 1024);
-		var mapsLength = ReadUnixProcSelfMaps(maps);
+		var maps = UnixMapsBuffer;
+		var mapsLength = ReadUnixProcSelfMaps(maps, UnixMapsBufferSize);
+		if (mapsLength == UnixMapsBufferSize)
+		{
+			// Truncated listing: mappings past the cut-off would be misreported as
+			// MEM_FREE and later zero-wiped. Fail the query instead; the fault then
+			// surfaces with full diagnostics rather than corrupting guest memory.
+			return false;
+		}
 		var offset = 0;
 		var pageAddress = AlignDown(address, 0x1000);
 		var nextMappedAddress = ulong.MaxValue;
@@ -457,7 +466,7 @@ public sealed unsafe partial class DirectExecutionBackend
 		return true;
 	}
 
-	private static int ReadUnixProcSelfMaps(byte[] destination)
+	private static int ReadUnixProcSelfMaps(byte* destination, int capacity)
 	{
 		Span<byte> path = stackalloc byte[16];
 		path[0] = (byte)'/';
@@ -488,21 +497,15 @@ public sealed unsafe partial class DirectExecutionBackend
 			var total = 0;
 			try
 			{
-				fixed (byte* destinationPointer = destination)
+				while (total < capacity)
 				{
-					while (total < destination.Length)
+					var read = unix_read(fd, destination + total, (nuint)(capacity - total));
+					if (read <= 0)
 					{
-						var read = unix_read(
-							fd,
-							destinationPointer + total,
-							(nuint)(destination.Length - total));
-						if (read <= 0)
-						{
-							break;
-						}
-
-						total += checked((int)read);
+						break;
 					}
+
+					total += checked((int)read);
 				}
 			}
 			finally
@@ -514,7 +517,7 @@ public sealed unsafe partial class DirectExecutionBackend
 		}
 	}
 
-	private static bool TryParseHexBytes(byte[] bytes, int start, int end, out ulong value)
+	private static bool TryParseHexBytes(byte* bytes, int start, int end, out ulong value)
 	{
 		value = 0;
 		if (start >= end)
@@ -549,7 +552,7 @@ public sealed unsafe partial class DirectExecutionBackend
 		return true;
 	}
 
-	private static uint UnixPermsToProtection(byte[] bytes, int start, int lineEnd)
+	private static uint UnixPermsToProtection(byte* bytes, int start, int lineEnd)
 	{
 		var read = start < lineEnd && bytes[start] == (byte)'r';
 		var write = start + 1 < lineEnd && bytes[start + 1] == (byte)'w';

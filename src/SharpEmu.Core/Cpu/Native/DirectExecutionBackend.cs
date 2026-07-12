@@ -4228,6 +4228,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		};
 		dispatcherThread.Start();
 		long num = (long)((double)stallWatchdogSeconds * Stopwatch.Frequency);
+		// A livelock with a slow trickle of imports keeps resetting _lastProgressTimestamp
+		// (DispatchImport marks progress every 64 imports), so the no-progress path below
+		// never fires and the wedge is invisible. Track the import-count delta per watchdog
+		// period as well: a tiny nonzero delta means the guest is wedged but polling.
+		long trickleLastImportCount = Volatile.Read(ref _importDispatchCount);
+		long trickleLastTimestamp = Stopwatch.GetTimestamp();
 		_stallWatchdogThread = new Thread(new ThreadStart(delegate
 		{
 			while (!_stallWatchdogStop)
@@ -4237,7 +4243,23 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				{
 					break;
 				}
-				long num2 = Stopwatch.GetTimestamp() - Volatile.Read(ref _lastProgressTimestamp);
+				long nowTimestamp = Stopwatch.GetTimestamp();
+				if (nowTimestamp - trickleLastTimestamp >= num)
+				{
+					long currentImportCount = Volatile.Read(ref _importDispatchCount);
+					long trickleDelta = currentImportCount - trickleLastImportCount;
+					trickleLastImportCount = currentImportCount;
+					trickleLastTimestamp = nowTimestamp;
+					if (trickleDelta > 0 && trickleDelta < 4096)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][WARN] Import trickle: only {trickleDelta} imports in {stallWatchdogSeconds}s (total={currentImportCount}); likely livelock — dumping state.");
+						LogStallWatchdogSnapshot();
+						DumpRecentImportTrace();
+						Console.Error.Flush();
+					}
+				}
+				long num2 = nowTimestamp - Volatile.Read(ref _lastProgressTimestamp);
 				if (num2 < num)
 				{
 					continue;
@@ -4399,10 +4421,48 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				Console.Error.WriteLine($"[LOADER][ERROR] Stall stack: [rsp]=0x{value:X16} [rsp+8]=0x{value2:X16}");
 			}
 
+			// Guest caller chain for the main thread (the scheduler threads get this from
+			// DumpBlockedGuestThreadFrames; main is a host thread and never went through it).
+			var mainRbp = cpuContext[CpuRegister.Rbp];
+			for (var depth = 0; depth < 16 && mainRbp != 0; depth++)
+			{
+				if (!cpuContext.TryReadUInt64(mainRbp + 8, out var mainRet) ||
+					!cpuContext.TryReadUInt64(mainRbp, out var mainNextRbp) ||
+					mainRet == 0)
+				{
+					break;
+				}
+
+				var mainIda = mainRet >= GuestModuleBaseForDiag ? mainRet - GuestModuleBaseForDiag : mainRet;
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] Stall main-frame#{depth}: ret=0x{mainRet:X16} ida=0x{mainIda:X}");
+
+				if (mainNextRbp <= mainRbp)
+				{
+					break;
+				}
+
+				mainRbp = mainNextRbp;
+			}
+
+			// Same FEvent probe as the blocked guest threads, for the main (host) thread: when it
+			// is parked in pthread_cond_wait, rsi holds the mutex, so the event object is rsi-32.
+			var mainMutex = cpuContext[CpuRegister.Rsi];
+			if (mainMutex >= 32 &&
+				cpuContext.TryReadUInt32(mainMutex - 12, out var mainEventState) &&
+				cpuContext.TryReadUInt32(mainMutex - 8, out var mainEventWaiters))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] Stall fevent(main): obj=0x{mainMutex - 32:X16} state={mainEventState} " +
+					$"guest_waiters={mainEventWaiters} " +
+					$"=> {(mainEventState != 0 ? "TRIGGERED-BUT-STILL-BLOCKED (lost wakeup on our side)" : "never triggered by guest")}");
+			}
+
 			var threads = SnapshotGuestThreads();
 			if (threads.Length != 0)
 			{
 				var logged = 0;
+				Span<byte> ripBytes = stackalloc byte[16];
 				foreach (var thread in threads)
 				{
 					var hostThreadId = Volatile.Read(ref thread.HostThreadId);
@@ -4424,6 +4484,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						$"state={thread.State} imports={Interlocked.Read(ref thread.ImportCount)} " +
 						$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
 						$"block={thread.BlockReason ?? "none"} wait_on={thread.BlockWakeKey ?? "none"}{hostContextText}");
+					if (hostContextText.Contains("host_rip", StringComparison.Ordinal) && _cpuContext is { } byteContext)
+					{
+						if (byteContext.Memory.TryRead(hostContext.Rip, ripBytes))
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][ERROR] Stall guest-thread:     bytes @host_rip: {BitConverter.ToString(ripBytes.ToArray()).Replace("-", " ")}");
+						}
+					}
+					DumpBlockedGuestThreadFrames(thread);
 					if (thread.BlockWakeKey is { } waitKey &&
 						waitKey.LastIndexOf("0x", StringComparison.Ordinal) is var hexIndex && hexIndex >= 0 &&
 						ulong.TryParse(waitKey.AsSpan(hexIndex + 2), System.Globalization.NumberStyles.HexNumber, null, out var waitAddress) &&
@@ -4446,8 +4515,76 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	// Walks the saved guest RBP chain of a blocked thread and prints each return address as an
+	// IDA offset (guest RIP - module base). The libkernel wrappers all park at the same address,
+	// so the caller chain is the only thing that identifies WHICH guest object a thread waits on.
+	private static void DumpBlockedGuestThreadFrames(GuestThreadState thread)
+	{
+		if (thread.State != GuestThreadRunState.Blocked || thread.Context is not { } context)
+		{
+			return;
+		}
+
+		try
+		{
+			var rbp = context[CpuRegister.Rbp];
+			var rdi = context[CpuRegister.Rdi];
+			var rsi = context[CpuRegister.Rsi];
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall guest-thread:     blocked_ctx: rdi=0x{rdi:X16} rsi=0x{rsi:X16} " +
+				$"rsp=0x{context[CpuRegister.Rsp]:X16} rbp=0x{rbp:X16}");
+
+			// UE5 FPThreadEvent (guest sub_1D87280/sub_1D91700): manual_reset@+17, state@+20
+			// (0=untriggered, 1=signalled-one, 2=signalled-all), waiters@+24, mutex@+32, cond@+40.
+			// A thread parked in cond_wait with state==1 means Trigger ran and WE dropped the
+			// wakeup; state==0 means the guest never triggered it.
+			if (thread.BlockReason is "pthread_cond_wait" or "pthread_cond_timedwait" && rsi >= 32)
+			{
+				var eventObject = rsi - 32;
+				if (context.TryReadUInt32(eventObject + 20, out var eventState) &&
+					context.TryReadUInt32(eventObject + 24, out var eventWaiters) &&
+					context.TryReadUInt32(eventObject + 17, out var manualReset))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Stall guest-thread:     fevent: obj=0x{eventObject:X16} " +
+						$"state={eventState} guest_waiters={eventWaiters} manual_reset={manualReset & 0xFF} " +
+						$"=> {(eventState != 0 ? "TRIGGERED-BUT-STILL-BLOCKED (lost wakeup on our side)" : "never triggered by guest")}");
+				}
+			}
+
+			for (var depth = 0; depth < 12 && rbp != 0; depth++)
+			{
+				if (!context.TryReadUInt64(rbp + 8, out var returnRip) ||
+					!context.TryReadUInt64(rbp, out var nextRbp) ||
+					returnRip == 0)
+				{
+					break;
+				}
+
+				var ida = returnRip >= GuestModuleBaseForDiag ? returnRip - GuestModuleBaseForDiag : returnRip;
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] Stall guest-thread:     frame#{depth}: ret=0x{returnRip:X16} ida=0x{ida:X}");
+
+				if (nextRbp <= rbp)
+				{
+					break;
+				}
+
+				rbp = nextRbp;
+			}
+		}
+		catch
+		{
+		}
+	}
+
 	private unsafe static bool TryCaptureHostThreadContext(int hostThreadId, out HostThreadContextSnapshot snapshot)
 	{
+		if (!OperatingSystem.IsWindows())
+		{
+			return TryCaptureUnixThreadContext(hostThreadId, out snapshot);
+		}
+
 		snapshot = default;
 		if (hostThreadId == 0 || unchecked((uint)hostThreadId) == GetCurrentThreadId())
 		{
@@ -4503,56 +4640,56 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	}
 
 
-	[DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+	[DllImport("kernel32.dll", EntryPoint = "GetModuleHandle", CharSet = CharSet.Unicode)]
 	private static extern nint WindowsGetModuleHandle(string lpModuleName);
 
-	[DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
+	[DllImport("kernel32.dll", EntryPoint = "GetProcAddress", CharSet = CharSet.Ansi)]
 	private static extern nint WindowsGetProcAddress(nint hModule, string procName);
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "TlsAlloc")]
 	private static extern uint WindowsTlsAlloc();
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "TlsFree")]
 	private static extern bool WindowsTlsFree(uint dwTlsIndex);
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "TlsSetValue")]
 	private static extern bool WindowsTlsSetValue(uint dwTlsIndex, nint lpTlsValue);
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "TlsGetValue")]
 	private static extern nint WindowsTlsGetValue(uint dwTlsIndex);
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "AddVectoredExceptionHandler")]
 	private static extern void* WindowsAddVectoredExceptionHandler(uint first, nint handler);
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "RemoveVectoredExceptionHandler")]
 	private static extern uint WindowsRemoveVectoredExceptionHandler(void* handle);
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "SetUnhandledExceptionFilter")]
 	private static extern nint WindowsSetUnhandledExceptionFilter(nint lpTopLevelExceptionFilter);
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "GetCurrentThreadId")]
 	private static extern uint WindowsGetCurrentThreadId();
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "GetCurrentThread")]
 	private static extern nint WindowsGetCurrentThread();
 
-	[DllImport("kernel32.dll", SetLastError = true)]
+	[DllImport("kernel32.dll", EntryPoint = "SetThreadAffinityMask", SetLastError = true)]
 	private static extern nuint WindowsSetThreadAffinityMask(nint hThread, nuint dwThreadAffinityMask);
 
-	[DllImport("kernel32.dll", SetLastError = true)]
+	[DllImport("kernel32.dll", EntryPoint = "OpenThread", SetLastError = true)]
 	private static extern nint WindowsOpenThread(uint dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, uint dwThreadId);
 
-	[DllImport("kernel32.dll", SetLastError = true)]
+	[DllImport("kernel32.dll", EntryPoint = "SuspendThread", SetLastError = true)]
 	private static extern uint WindowsSuspendThread(nint hThread);
 
-	[DllImport("kernel32.dll", SetLastError = true)]
+	[DllImport("kernel32.dll", EntryPoint = "ResumeThread", SetLastError = true)]
 	private static extern uint WindowsResumeThread(nint hThread);
 
-	[DllImport("kernel32.dll", SetLastError = true)]
+	[DllImport("kernel32.dll", EntryPoint = "GetThreadContext", SetLastError = true)]
 	[return: MarshalAs(UnmanagedType.Bool)]
 	private static extern bool WindowsGetThreadContext(nint hThread, void* lpContext);
 
-	[DllImport("kernel32.dll", SetLastError = true)]
+	[DllImport("kernel32.dll", EntryPoint = "CloseHandle", SetLastError = true)]
 	[return: MarshalAs(UnmanagedType.Bool)]
 	private static extern bool WindowsCloseHandle(nint hObject);
 
@@ -4681,24 +4818,24 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		Volatile.Write(ref _globalUnresolvedReturnStub, 0uL);
 	}
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "VirtualAlloc")]
 	private static extern void* WindowsVirtualAlloc(void* lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "VirtualFree")]
 	[return: MarshalAs(UnmanagedType.Bool)]
 	private static extern bool WindowsVirtualFree(void* lpAddress, nuint dwSize, uint dwFreeType);
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "VirtualProtect")]
 	[return: MarshalAs(UnmanagedType.Bool)]
 	private static extern bool WindowsVirtualProtect(void* lpAddress, nuint dwSize, uint flNewProtect, uint* lpflOldProtect);
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "GetCurrentProcess")]
 	private static extern void* WindowsGetCurrentProcess();
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "FlushInstructionCache")]
 	[return: MarshalAs(UnmanagedType.Bool)]
 	private static extern bool WindowsFlushInstructionCache(void* hProcess, void* lpBaseAddress, nuint dwSize);
 
-	[DllImport("kernel32.dll")]
+	[DllImport("kernel32.dll", EntryPoint = "VirtualQuery")]
 	private static extern nuint WindowsVirtualQuery(void* lpAddress, out MEMORY_BASIC_INFORMATION64 lpBuffer, nuint dwLength);
 }

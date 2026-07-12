@@ -17,9 +17,42 @@ public sealed partial class DirectExecutionBackend
 {
 	private const ulong LazyCommitWindowBytes = 0x0200_0000UL;
 	private static int _lazyCommitTraceCount;
+	private static int _lazyCommitGate;
+
+	// Guest threads execute managed HLE exports on a hijacked (non-CLR-owned) call stack.
+	// Lazily running a static constructor or the managed-exception/resource-loading machinery
+	// for the FIRST time in that context fail-fasts the whole CLR with the misleading
+	// "Invalid Program: attempted to call a UnmanagedCallersOnly method from managed code".
+	// Force the fragile paths to initialize here, once, on a normal host thread during setup.
+	private static int _guestThreadRuntimeWarmed;
+	private static void WarmGuestThreadSensitiveRuntime()
+	{
+		if (Interlocked.Exchange(ref _guestThreadRuntimeWarmed, 1) != 0)
+		{
+			return;
+		}
+
+		try
+		{
+			// Trigger the IOException + SR.GetResourceString + ResourceReader..cctor path that
+			// KernelOpenUnderscore (and other file HLE) hits when a guest opens a missing file.
+			var probe = System.IO.Path.Combine(
+				System.IO.Path.GetTempPath(),
+				"sharpemu-warm-" + Guid.NewGuid().ToString("N"),
+				"missing");
+			using var _ = new System.IO.FileStream(probe, System.IO.FileMode.Open, System.IO.FileAccess.Read);
+		}
+		catch (Exception)
+		{
+			// Expected: the probe path does not exist. The point is to run the exception and
+			// resource machinery now, on this normal thread, so no guest thread ever runs it lazily.
+		}
+	}
 
 	private unsafe void SetupExceptionHandler()
 	{
+		WarmGuestThreadSensitiveRuntime();
+
 		if (!OperatingSystem.IsWindows())
 		{
 			InstallUnixSignalHandlers();
@@ -158,6 +191,10 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine($"[LOADER][INFO]   Code: 0x{exceptionCode:X8}");
 			Console.Error.WriteLine($"[LOADER][INFO]   Exception Address: 0x{exceptionAddress:X16}");
 			Console.Error.WriteLine($"[LOADER][INFO]   RIP: 0x{rip:X16}");
+			if (rip >= GuestModuleBaseForDiag)
+			{
+				Console.Error.WriteLine($"[LOADER][INFO]   RIP module_offset (IDA): 0x{rip - GuestModuleBaseForDiag:X}");
+			}
 			if (TryFormatNearestRuntimeSymbol(rip, out string symbol))
 			{
 				Console.Error.WriteLine("[LOADER][INFO]   RIP symbol: " + symbol);
@@ -987,6 +1024,28 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
+
+		// Serialized: two threads faulting in the same window must not both see a
+		// stale MEM_FREE query and race their reserve/commit against each other.
+		// Spin gate rather than Monitor — this runs inside the SIGSEGV handler,
+		// where managed blocking primitives are unsafe.
+		while (Interlocked.CompareExchange(ref _lazyCommitGate, 1, 0) != 0)
+		{
+			Thread.SpinWait(64);
+		}
+
+		try
+		{
+			return HandleLazyCommittedPageLocked(faultAddress, accessType, owner, rip, rsp);
+		}
+		finally
+		{
+			Volatile.Write(ref _lazyCommitGate, 0);
+		}
+	}
+
+	private unsafe bool HandleLazyCommittedPageLocked(ulong faultAddress, ulong accessType, string owner, ulong rip, ulong rsp)
+	{
 		if (VirtualQuery((void*)faultAddress, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
 		{
 			return false;
@@ -1078,8 +1137,11 @@ public sealed partial class DirectExecutionBackend
 					committedBase = pageBase;
 					committedSize = 4096uL;
 				}
-				else if (!OperatingSystem.IsWindows() && TryReserveThenCommitReplace(pageBase, 4096uL, pageBase, 4096uL, commitProtect))
+				else if (!OperatingSystem.IsWindows() && TryCommitRange(pageBase, 4096uL, commitProtect))
 				{
+					// The reserve failed because the page is already mapped (the
+					// MEM_FREE query was stale); commit-in-place keeps its contents
+					// instead of replacing it with a zero page.
 					committed = true;
 					committedBase = pageBase;
 					committedSize = 4096uL;
@@ -1216,16 +1278,6 @@ public sealed partial class DirectExecutionBackend
 				return false;
 			}
 			return TryCommitRange(commitAddress, commitSize, protection);
-		}
-
-		static unsafe bool TryReserveThenCommitReplace(ulong reserveAddress, ulong reserveSize, ulong commitAddress, ulong commitSize, uint protection)
-		{
-			if (reserveAddress != commitAddress || reserveSize != commitSize)
-			{
-				return false;
-			}
-
-			return VirtualAllocFixedReplace((void*)reserveAddress, (nuint)reserveSize, 4096u | 8192u, protection) != null;
 		}
 
 		static bool IsAccessCompatible(ulong accessType, uint protection)

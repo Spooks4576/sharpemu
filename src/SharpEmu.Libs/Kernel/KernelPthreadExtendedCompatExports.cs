@@ -87,6 +87,13 @@ public static class KernelPthreadExtendedCompatExports
         public PthreadAttrState Attributes { get; set; } = PthreadAttrState.Default;
     }
 
+    // Counter lives on the OUTER class deliberately: a static field on the nested state class
+    // gives it a type initializer that first runs on a GUEST thread, whose hijacked stack the CLR
+    // cannot walk — that fail-fasts the process with the misleading "Invalid Program: attempted to
+    // call a UnmanagedCallersOnly method from managed code" (observed crashing in
+    // PthreadRwlockState..ctor). The outer class is already initialized when any export runs.
+    private static long _nextRwlockWakeId;
+
     private sealed class PthreadRwlockState
     {
         public object SyncRoot { get; } = new();
@@ -96,6 +103,10 @@ public static class KernelPthreadExtendedCompatExports
         public int CompatWriterTotalCount { get; set; }
         public ulong WriterThreadId { get; set; }
         public int WaitingWriters { get; set; }
+
+        // Stable per-state block/wake key (see PthreadMutexState.WakeKey) — avoids a
+        // lock/unlock wake-key mismatch when an rwlock is reachable via aliased addresses.
+        public string WakeKey { get; } = "pthread_rwlock#" + Interlocked.Increment(ref _nextRwlockWakeId).ToString("X");
 
         public int GetReaderCount(ulong threadId)
         {
@@ -1072,7 +1083,7 @@ public static class KernelPthreadExtendedCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED;
         }
 
-        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetRwlockWakeKey(resolvedAddress));
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(rwlock.WakeKey);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1296,6 +1307,7 @@ public static class KernelPthreadExtendedCompatExports
 
                 if (rwlock.WriterThreadId == 0 && rwlock.ReaderTotalCount == 0 && rwlock.CompatWriterTotalCount == 0)
                 {
+                    DetectRwlockWriterConflict(resolvedAddress, rwlock, currentThreadId, "wrlock");
                     rwlock.WriterThreadId = currentThreadId;
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 }
@@ -1309,7 +1321,7 @@ public static class KernelPthreadExtendedCompatExports
                         GuestThreadExecution.RequestCurrentThreadBlock(
                             ctx,
                             "pthread_rwlock_wrlock",
-                            GetRwlockWakeKey(resolvedAddress),
+                            rwlock.WakeKey,
                             static () => (int)OrbisGen2Result.ORBIS_GEN2_OK,
                             () => TryAcquireBlockedRwlock(rwlock, currentThreadId, write: true)))
                     {
@@ -1346,7 +1358,7 @@ public static class KernelPthreadExtendedCompatExports
                         GuestThreadExecution.RequestCurrentThreadBlock(
                             ctx,
                             "pthread_rwlock_rdlock",
-                            GetRwlockWakeKey(resolvedAddress),
+                            rwlock.WakeKey,
                             static () => (int)OrbisGen2Result.ORBIS_GEN2_OK,
                             () => TryAcquireBlockedRwlock(rwlock, currentThreadId, write: false)))
                     {
@@ -1356,6 +1368,13 @@ public static class KernelPthreadExtendedCompatExports
                     Monitor.Wait(rwlock.SyncRoot);
                 }
 
+                if (rwlock.WriterThreadId != 0 ||
+                    rwlock.CompatWriterTotalCount > rwlock.CompatWriterCounts.GetValueOrDefault(currentThreadId))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][ERROR] RWLOCK READER/WRITER COEXIST: resolved=0x{resolvedAddress:X} reader=0x{currentThreadId:X} " +
+                        $"writer=0x{rwlock.WriterThreadId:X} compat_total={rwlock.CompatWriterTotalCount} readers_total={rwlock.ReaderTotalCount}");
+                }
                 rwlock.AddReader(currentThreadId);
             }
         }
@@ -1374,6 +1393,7 @@ public static class KernelPthreadExtendedCompatExports
                     return false;
                 }
 
+                DetectRwlockWriterConflict(0, rwlock, currentThreadId, "wrlock-resume");
                 rwlock.WriterThreadId = currentThreadId;
                 rwlock.WaitingWriters = Math.Max(0, rwlock.WaitingWriters - 1);
                 return true;
@@ -1386,6 +1406,22 @@ public static class KernelPthreadExtendedCompatExports
 
             rwlock.AddReader(currentThreadId);
             return true;
+        }
+    }
+
+    // Called while holding lock(rwlock.SyncRoot) just before granting an exclusive write lock:
+    // any existing reader/writer/foreign-compat-writer means two threads would hold the rwlock
+    // with a writer present — a data race. Suspected source of the AGC command-buffer
+    // use-after-free (null-vtable) crash.
+    private static void DetectRwlockWriterConflict(ulong resolvedAddress, PthreadRwlockState rwlock, ulong currentThreadId, string site)
+    {
+        if (rwlock.WriterThreadId != 0 ||
+            rwlock.ReaderTotalCount != 0 ||
+            rwlock.CompatWriterTotalCount > rwlock.CompatWriterCounts.GetValueOrDefault(currentThreadId))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][ERROR] RWLOCK WRITER CONFLICT at {site}: resolved=0x{resolvedAddress:X} writer=0x{currentThreadId:X} " +
+                $"existing_writer=0x{rwlock.WriterThreadId:X} readers_total={rwlock.ReaderTotalCount} compat_total={rwlock.CompatWriterTotalCount}");
         }
     }
 

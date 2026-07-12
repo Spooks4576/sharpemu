@@ -15,6 +15,14 @@ namespace SharpEmu.Libs.Kernel;
 public static class KernelMemoryCompatExports
 {
     private const int MaxGuestStringLength = 4096;
+
+    // Upper bound on any single guest-controlled allocation performed by an HLE export.
+    // A garbage/absurd count from a corrupted guest call context must never reach a
+    // multi-GB managed allocation: doing so corrupts the CLR heap outright and surfaces
+    // later as the misleading "Invalid Program: attempted to call a UnmanagedCallersOnly
+    // method from managed code" fatal. Reject anything above this before allocating.
+    private const ulong MaxSaneGuestAllocationBytes = 512UL * 1024 * 1024;
+
     private const int WideCharSize = sizeof(ushort);
     private const int MemsetChunkSize = 16 * 1024;
     private const int TlsModuleBlockSize = 0x10000;
@@ -142,7 +150,7 @@ public static class KernelMemoryCompatExports
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern nuint VirtualQuery(nint lpAddress, out MemoryBasicInformation lpBuffer, nuint dwLength);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
+    [DllImport("kernel32.dll", EntryPoint = "VirtualProtect", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool WindowsVirtualProtect(nint lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect);
 
@@ -920,12 +928,14 @@ public static class KernelMemoryCompatExports
     {
         var destination = ctx[CpuRegister.Rdi];
         var source = ctx[CpuRegister.Rsi];
-        var count = (int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue);
-        if (count < 0)
+        var rawCount = ctx[CpuRegister.Rdx];
+        if (rawCount > MaxSaneGuestAllocationBytes)
         {
+            Console.Error.WriteLine($"[LOADER][WARNING] strncpy oversized count rejected: dst=0x{destination:X16} src=0x{source:X16} count=0x{rawCount:X}");
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        var count = (int)rawCount;
         var payload = new byte[count];
         Span<byte> one = stackalloc byte[1];
         var copied = 0;
@@ -965,12 +975,13 @@ public static class KernelMemoryCompatExports
 
     private static int WcsncpyCore(CpuContext ctx, ulong destination, ulong source, ulong countValue)
     {
-        var count = (int)Math.Min(countValue, int.MaxValue);
-        if (count < 0 || count > (int.MaxValue / WideCharSize))
+        if (countValue > MaxSaneGuestAllocationBytes / WideCharSize)
         {
+            Console.Error.WriteLine($"[LOADER][WARNING] wcsncpy oversized count rejected: dst=0x{destination:X16} src=0x{source:X16} count=0x{countValue:X}");
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        var count = (int)countValue;
         var payload = new byte[count * WideCharSize];
         for (var copied = 0; copied < count; copied++)
         {
@@ -1172,8 +1183,7 @@ public static class KernelMemoryCompatExports
         // call context corrupted the CLR outright ("Invalid Program: attempted to call a
         // UnmanagedCallersOnly method from managed code") instead of throwing a normal
         // exception. Reject anything above a sane bound before allocating.
-        const ulong maxSaneCount = 512UL * 1024 * 1024;
-        if (rawCount > maxSaneCount)
+        if (rawCount > MaxSaneGuestAllocationBytes)
         {
             Console.Error.WriteLine($"[LOADER][WARNING] memcpy oversized count rejected: dst=0x{destination:X16} src=0x{source:X16} count=0x{rawCount:X}");
             ctx[CpuRegister.Rax] = destination;
@@ -1572,6 +1582,18 @@ public static class KernelMemoryCompatExports
                 LogOpenTrace($"_open dir path='{guestPath}' host='{hostPath}' flags=0x{flags:X8} fd={directoryFd}");
                 ctx[CpuRegister.Rax] = unchecked((ulong)directoryFd);
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            // Opening a missing file without O_CREAT always fails with NOT_FOUND. Handle it
+            // explicitly instead of letting `new FileStream` throw: the guest probes many
+            // absent files, and .NET's IOException path lazily runs ResourceReader..cctor /
+            // resource-string loading, which is unsafe on a guest-thread call context and
+            // fail-fasts the whole CLR ("Invalid Program: attempted to call a
+            // UnmanagedCallersOnly method from managed code") before this catch can run.
+            if ((flags & O_CREAT) == 0 && !File.Exists(hostPath))
+            {
+                LogOpenTrace($"_open miss path='{guestPath}' host='{hostPath}' flags=0x{flags:X8}");
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
             EnsureOpenParentDirectoryExists(guestPath, hostPath, flags);
@@ -1982,7 +2004,7 @@ public static class KernelMemoryCompatExports
     {
         var fd = unchecked((int)ctx[CpuRegister.Rdi]);
         var bufferAddress = ctx[CpuRegister.Rsi];
-        var requested = (int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue);
+        var requested = (int)Math.Min(ctx[CpuRegister.Rdx], MaxSaneGuestAllocationBytes);
         if (requested < 0 || (requested > 0 && bufferAddress == 0))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
@@ -2191,7 +2213,7 @@ public static class KernelMemoryCompatExports
     {
         var fd = unchecked((int)ctx[CpuRegister.Rdi]);
         var bufferAddress = ctx[CpuRegister.Rsi];
-        var requested = (int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue);
+        var requested = (int)Math.Min(ctx[CpuRegister.Rdx], MaxSaneGuestAllocationBytes);
         if (requested < 0 || (requested > 0 && bufferAddress == 0))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
@@ -2867,6 +2889,16 @@ public static class KernelMemoryCompatExports
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "BQQniolj9tQ",
+        ExportName = "sceKernelMapDirectMemory2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelMapDirectMemory2(CpuContext ctx)
+    {
+        return KernelMapDirectMemory(ctx);
     }
 
     [SysAbiExport(
@@ -4421,6 +4453,71 @@ public static class KernelMemoryCompatExports
 
     public static string ResolveGuestPath(string guestPath)
     {
+        return ResolveHostPathCaseInsensitive(ResolveGuestPathCore(guestPath));
+    }
+
+    private static string ResolveHostPathCaseInsensitive(string hostPath)
+    {
+        if (OperatingSystem.IsWindows() ||
+            string.IsNullOrWhiteSpace(hostPath) ||
+            Path.Exists(hostPath))
+        {
+            return hostPath;
+        }
+
+        var root = Path.IsPathRooted(hostPath) ? Path.GetPathRoot(hostPath)! : string.Empty;
+        var remainder = hostPath[root.Length..];
+        if (remainder.Length == 0)
+        {
+            return hostPath;
+        }
+
+        var resolved = root.Length == 0 ? "." : root;
+        var usedFallback = false;
+        foreach (var segment in remainder.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var candidate = Path.Combine(resolved, segment);
+            if (Path.Exists(candidate))
+            {
+                resolved = candidate;
+                continue;
+            }
+
+            string? match = null;
+            try
+            {
+                foreach (var entry in Directory.EnumerateFileSystemEntries(resolved))
+                {
+                    if (string.Equals(Path.GetFileName(entry), segment, StringComparison.OrdinalIgnoreCase))
+                    {
+                        match = entry;
+                        break;
+                    }
+                }
+            }
+            catch (IOException)
+            {
+                return hostPath;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return hostPath;
+            }
+
+            if (match is null)
+            {
+                return usedFallback ? Path.Combine(resolved, segment) : hostPath;
+            }
+
+            resolved = match;
+            usedFallback = true;
+        }
+
+        return usedFallback ? resolved : hostPath;
+    }
+
+    private static string ResolveGuestPathCore(string guestPath)
+    {
         if (string.IsNullOrWhiteSpace(guestPath))
         {
             return guestPath;
@@ -4545,8 +4642,8 @@ public static class KernelMemoryCompatExports
                 !guestPath.StartsWith("/", StringComparison.Ordinal) &&
                 !guestPath.StartsWith("\\", StringComparison.Ordinal))
             {
-                var relative = guestPath.Replace('/', Path.DirectorySeparatorChar);
-                return Path.Combine(app0Root, relative);
+                var relative = NormalizeMountRelativePath(guestPath);
+                return relative.Length == 0 ? app0Root : Path.Combine(app0Root, relative);
             }
         }
 
@@ -4631,10 +4728,44 @@ public static class KernelMemoryCompatExports
 
     private static string NormalizeMountRelativePath(string relativePath)
     {
-        return relativePath
+        var trimmed = relativePath
             .TrimStart('/', '\\')
             .Replace('/', Path.DirectorySeparatorChar)
             .Replace('\\', Path.DirectorySeparatorChar);
+
+        return CollapseMountRelativeSegments(trimmed);
+    }
+
+    private static string CollapseMountRelativeSegments(string relativePath)
+    {
+        if (relativePath.Length == 0 ||
+            (!relativePath.Contains('.') && !relativePath.Contains(Path.DirectorySeparatorChar)))
+        {
+            return relativePath;
+        }
+
+        var segments = new List<string>();
+        foreach (var segment in relativePath.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (segment == ".")
+            {
+                continue;
+            }
+
+            if (segment == "..")
+            {
+                if (segments.Count > 0)
+                {
+                    segments.RemoveAt(segments.Count - 1);
+                }
+
+                continue;
+            }
+
+            segments.Add(segment);
+        }
+
+        return string.Join(Path.DirectorySeparatorChar, segments);
     }
 
     private static string ResolveDevlogAppRoot()
@@ -4953,35 +5084,10 @@ public static class KernelMemoryCompatExports
     }
 
     private static bool TryReadWideCString(CpuContext ctx, ulong address, ulong maxLength, out ushort[] units)
-    {
-        units = Array.Empty<ushort>();
-        if (address == 0)
-        {
-            return false;
-        }
+        => TryReadWideCStringBounded(ctx, address, maxLength, out units, out _);
 
-        var limit = (int)Math.Min(maxLength, 1_048_576UL);
-        var buffer = GC.AllocateUninitializedArray<ushort>(limit);
-        for (var i = 0; i < limit; i++)
-        {
-            if (!TryReadUInt16Compat(ctx, address + ((ulong)i * WideCharSize), out var unit))
-            {
-                return false;
-            }
-
-            if (unit == 0)
-            {
-                units = TrimWideUnits(buffer, i);
-                return true;
-            }
-
-            buffer[i] = unit;
-        }
-
-        units = buffer;
-        return true;
-    }
-
+    // Measure first, then allocate exactly the length. Allocating the 1 MiB ceiling up front put a
+    // 2 MB array on the LOH every call, and the GC it forced fail-fasted on the guest stack.
     private static bool TryReadWideCStringBounded(CpuContext ctx, ulong address, ulong maxLength, out ushort[] units, out bool terminated)
     {
         units = Array.Empty<ushort>();
@@ -4992,10 +5098,11 @@ public static class KernelMemoryCompatExports
         }
 
         var limit = (int)Math.Min(maxLength, 1_048_576UL);
-        var buffer = GC.AllocateUninitializedArray<ushort>(limit);
-        for (var i = 0; i < limit; i++)
+
+        var length = 0;
+        while (length < limit)
         {
-            if (!TryReadUInt16Compat(ctx, address + ((ulong)i * WideCharSize), out var unit))
+            if (!TryReadUInt16Compat(ctx, address + ((ulong)length * WideCharSize), out var unit))
             {
                 return false;
             }
@@ -5003,8 +5110,23 @@ public static class KernelMemoryCompatExports
             if (unit == 0)
             {
                 terminated = true;
-                units = TrimWideUnits(buffer, i);
-                return true;
+                break;
+            }
+
+            length++;
+        }
+
+        if (length == 0)
+        {
+            return true;
+        }
+
+        var buffer = GC.AllocateUninitializedArray<ushort>(length);
+        for (var i = 0; i < length; i++)
+        {
+            if (!TryReadUInt16Compat(ctx, address + ((ulong)i * WideCharSize), out var unit))
+            {
+                return false;
             }
 
             buffer[i] = unit;
@@ -6270,6 +6392,24 @@ public static class KernelMemoryCompatExports
     private static bool TryQueryHostPage(ulong address, out MemoryBasicInformation info)
     {
         info = default;
+
+        if (!OperatingSystem.IsWindows())
+        {
+            // kernel32!VirtualQuery does not exist on Linux (crashed with
+            // "libkernel32.dll: cannot open shared object file"). Probe mapped-ness with msync:
+            // it returns ENOMEM(-1) for an unmapped range and 0 for a mapped one. Guest pages we
+            // hand out are read/write, so report RW when mapped.
+            var pageBase = (nint)(address & ~0xFFFUL);
+            if (msync(pageBase, 0x1000, MS_ASYNC) != 0)
+            {
+                return false;
+            }
+
+            info.State = MemCommit;
+            info.Protect = HostPageReadWrite;
+            return true;
+        }
+
         var size = (nuint)Marshal.SizeOf<MemoryBasicInformation>();
         if (VirtualQuery((nint)address, out info, size) == 0)
         {
@@ -6278,6 +6418,11 @@ public static class KernelMemoryCompatExports
 
         return info.State == MemCommit;
     }
+
+    private const int MS_ASYNC = 1;
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int msync(nint addr, nuint length, int flags);
 
     private static bool HasRequiredProtection(uint protect, bool writeAccess)
     {
