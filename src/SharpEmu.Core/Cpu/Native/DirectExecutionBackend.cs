@@ -510,7 +510,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static readonly RawExceptionHandlerDelegate RawUnhandledFilterDelegateInstance = RawUnhandledFilterManaged;
 
 	private static readonly nint ImportGatewayPtr =
-		Marshal.GetFunctionPointerForDelegate(ImportGatewayDelegateInstance);
+		CreateWin64ImportGatewayThunk(Marshal.GetFunctionPointerForDelegate(ImportGatewayDelegateInstance));
 
 	private static readonly nint RawVectoredHandlerPtrManaged =
 		Marshal.GetFunctionPointerForDelegate(RawVectoredHandlerDelegateInstance);
@@ -743,22 +743,21 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			throw new OutOfMemoryException("Failed to allocate native TLS slots");
 		}
-		nint kernel32 = GetModuleHandle("kernel32.dll");
-		_tlsGetValueAddress = kernel32 != 0 ? GetProcAddress(kernel32, "TlsGetValue") : 0;
+		_tlsGetValueAddress = ResolveHostProcedure("TlsGetValue");
 		if (_tlsGetValueAddress == 0)
 		{
-			throw new InvalidOperationException("Failed to resolve kernel32!TlsGetValue");
+			throw new InvalidOperationException("Failed to resolve host TlsGetValue");
 		}
-		_queryPerformanceCounterAddress = kernel32 != 0 ? GetProcAddress(kernel32, "QueryPerformanceCounter") : 0;
+		_queryPerformanceCounterAddress = ResolveHostProcedure("QueryPerformanceCounter");
 		if (_queryPerformanceCounterAddress == 0)
 		{
-			throw new InvalidOperationException("Failed to resolve kernel32!QueryPerformanceCounter");
+			throw new InvalidOperationException("Failed to resolve host QueryPerformanceCounter");
 		}
-		_switchToThreadAddress = kernel32 != 0 ? GetProcAddress(kernel32, "SwitchToThread") : 0;
-		_sleepAddress = kernel32 != 0 ? GetProcAddress(kernel32, "Sleep") : 0;
+		_switchToThreadAddress = ResolveHostProcedure("SwitchToThread");
+		_sleepAddress = ResolveHostProcedure("Sleep");
 		if (_switchToThreadAddress == 0 || _sleepAddress == 0)
 		{
-			throw new InvalidOperationException("Failed to resolve kernel32 thread timing functions");
+			throw new InvalidOperationException("Failed to resolve host thread timing functions");
 		}
 		_tlsBaseAddress = (nint)VirtualAlloc(null, 4096u, 12288u, 4u);
 		if (_tlsBaseAddress == 0)
@@ -4232,6 +4231,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					MarkExecutionProgress();
 					continue;
 				}
+				if (IsExpectedBlockingImportStall(out var blockingNid, out var blockingName))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][WARN] No import progress for {stallWatchdogSeconds}s while waiting in {blockingName} ({blockingNid}); continuing.");
+					LogStallWatchdogSnapshot();
+					Console.Error.Flush();
+					MarkExecutionProgress();
+					continue;
+				}
 				if (Interlocked.Exchange(ref _stallWatchdogTriggered, 1) != 0)
 				{
 					continue;
@@ -4262,6 +4270,37 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					return true;
 				}
 			}
+		}
+
+		return false;
+	}
+
+	private bool IsExpectedBlockingImportStall(out string nid, out string name)
+	{
+		nid = string.Empty;
+		name = string.Empty;
+		var cpuContext = _cpuContext;
+		if (cpuContext is null)
+		{
+			return false;
+		}
+
+		var importAddress = cpuContext.Rip & 0xFFFFFFFFFFFFFFF0uL;
+		foreach (var entry in _importEntries)
+		{
+			if (entry.Address != importAddress)
+			{
+				continue;
+			}
+
+			nid = entry.Nid;
+			name = _moduleManager.TryGetExport(nid, out var export)
+				? $"{export.LibraryName}:{export.Name}"
+				: nid;
+			return nid is
+				"Op8TBGY5KHg" or // pthread_cond_wait
+				"27bAgiJmOh0" or // pthread_cond_timedwait
+				"fzyMKs9kim0";   // sceKernelWaitEqueue
 		}
 
 		return false;
@@ -4427,58 +4466,58 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	}
 
 
-	[DllImport("kernel32.dll")]
-	private static extern uint TlsAlloc();
-
-	[DllImport("kernel32.dll")]
-	private static extern bool TlsFree(uint dwTlsIndex);
-
-	[DllImport("kernel32.dll")]
-	private static extern bool TlsSetValue(uint dwTlsIndex, nint lpTlsValue);
-
-	[DllImport("kernel32.dll")]
-	private static extern nint TlsGetValue(uint dwTlsIndex);
-
 	[DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-	private static extern nint GetModuleHandle(string lpModuleName);
+	private static extern nint WindowsGetModuleHandle(string lpModuleName);
 
 	[DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
-	private static extern nint GetProcAddress(nint hModule, string procName);
+	private static extern nint WindowsGetProcAddress(nint hModule, string procName);
 
 	[DllImport("kernel32.dll")]
-	private unsafe static extern void* AddVectoredExceptionHandler(uint first, IntPtr handler);
+	private static extern uint WindowsTlsAlloc();
 
 	[DllImport("kernel32.dll")]
-	private unsafe static extern uint RemoveVectoredExceptionHandler(void* handle);
+	private static extern bool WindowsTlsFree(uint dwTlsIndex);
 
 	[DllImport("kernel32.dll")]
-	private static extern IntPtr SetUnhandledExceptionFilter(IntPtr lpTopLevelExceptionFilter);
+	private static extern bool WindowsTlsSetValue(uint dwTlsIndex, nint lpTlsValue);
 
 	[DllImport("kernel32.dll")]
-	private static extern uint GetCurrentThreadId();
+	private static extern nint WindowsTlsGetValue(uint dwTlsIndex);
 
 	[DllImport("kernel32.dll")]
-	private static extern nint GetCurrentThread();
+	private static extern void* WindowsAddVectoredExceptionHandler(uint first, nint handler);
+
+	[DllImport("kernel32.dll")]
+	private static extern uint WindowsRemoveVectoredExceptionHandler(void* handle);
+
+	[DllImport("kernel32.dll")]
+	private static extern nint WindowsSetUnhandledExceptionFilter(nint lpTopLevelExceptionFilter);
+
+	[DllImport("kernel32.dll")]
+	private static extern uint WindowsGetCurrentThreadId();
+
+	[DllImport("kernel32.dll")]
+	private static extern nint WindowsGetCurrentThread();
 
 	[DllImport("kernel32.dll", SetLastError = true)]
-	private static extern nuint SetThreadAffinityMask(nint hThread, nuint dwThreadAffinityMask);
+	private static extern nuint WindowsSetThreadAffinityMask(nint hThread, nuint dwThreadAffinityMask);
 
 	[DllImport("kernel32.dll", SetLastError = true)]
-	private static extern nint OpenThread(uint dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, uint dwThreadId);
+	private static extern nint WindowsOpenThread(uint dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, uint dwThreadId);
 
 	[DllImport("kernel32.dll", SetLastError = true)]
-	private static extern uint SuspendThread(nint hThread);
+	private static extern uint WindowsSuspendThread(nint hThread);
 
 	[DllImport("kernel32.dll", SetLastError = true)]
-	private static extern uint ResumeThread(nint hThread);
+	private static extern uint WindowsResumeThread(nint hThread);
 
 	[DllImport("kernel32.dll", SetLastError = true)]
 	[return: MarshalAs(UnmanagedType.Bool)]
-	private unsafe static extern bool GetThreadContext(nint hThread, void* lpContext);
+	private static extern bool WindowsGetThreadContext(nint hThread, void* lpContext);
 
 	[DllImport("kernel32.dll", SetLastError = true)]
 	[return: MarshalAs(UnmanagedType.Bool)]
-	private static extern bool CloseHandle(nint hObject);
+	private static extern bool WindowsCloseHandle(nint hObject);
 
 	public unsafe void Dispose()
 	{
@@ -4606,23 +4645,23 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	}
 
 	[DllImport("kernel32.dll")]
-	private unsafe static extern void* VirtualAlloc(void* lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
+	private static extern void* WindowsVirtualAlloc(void* lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
 
 	[DllImport("kernel32.dll")]
 	[return: MarshalAs(UnmanagedType.Bool)]
-	private unsafe static extern bool VirtualFree(void* lpAddress, nuint dwSize, uint dwFreeType);
+	private static extern bool WindowsVirtualFree(void* lpAddress, nuint dwSize, uint dwFreeType);
 
 	[DllImport("kernel32.dll")]
 	[return: MarshalAs(UnmanagedType.Bool)]
-	private unsafe static extern bool VirtualProtect(void* lpAddress, nuint dwSize, uint flNewProtect, uint* lpflOldProtect);
+	private static extern bool WindowsVirtualProtect(void* lpAddress, nuint dwSize, uint flNewProtect, uint* lpflOldProtect);
 
 	[DllImport("kernel32.dll")]
-	private unsafe static extern void* GetCurrentProcess();
+	private static extern void* WindowsGetCurrentProcess();
 
 	[DllImport("kernel32.dll")]
 	[return: MarshalAs(UnmanagedType.Bool)]
-	private unsafe static extern bool FlushInstructionCache(void* hProcess, void* lpBaseAddress, nuint dwSize);
+	private static extern bool WindowsFlushInstructionCache(void* hProcess, void* lpBaseAddress, nuint dwSize);
 
 	[DllImport("kernel32.dll")]
-	private unsafe static extern nuint VirtualQuery(void* lpAddress, out MEMORY_BASIC_INFORMATION64 lpBuffer, nuint dwLength);
+	private static extern nuint WindowsVirtualQuery(void* lpAddress, out MEMORY_BASIC_INFORMATION64 lpBuffer, nuint dwLength);
 }

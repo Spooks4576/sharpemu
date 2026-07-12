@@ -433,10 +433,12 @@ public static class KernelEventQueueCompatExports
         short filter,
         ulong data)
     {
-        List<ulong>? wakeHandles = null;
+        ulong[]? wakeHandles = null;
+        var wakeHandleCount = 0;
         var triggeredCount = 0;
         lock (_eventQueueGate)
         {
+            wakeHandles = GC.AllocateUninitializedArray<ulong>(_registeredEvents.Count);
             foreach (var (handle, registrations) in _registeredEvents)
             {
                 if (!registrations.TryGetValue((ident, filter), out var registration))
@@ -459,17 +461,78 @@ public static class KernelEventQueueCompatExports
                         1,
                         data,
                         registration.UserData));
-                (wakeHandles ??= new List<ulong>()).Add(handle);
+                wakeHandles[wakeHandleCount++] = handle;
                 triggeredCount++;
+            }
+
+            if (triggeredCount != 0)
+            {
+                Monitor.PulseAll(_eventQueueGate);
             }
         }
 
-        if (wakeHandles is not null)
+        for (var i = 0; i < wakeHandleCount; i++)
         {
-            foreach (var handle in wakeHandles)
+            WakeEventQueue(wakeHandles![i]);
+        }
+
+        return triggeredCount;
+    }
+
+    public static int TriggerRegisteredEventsByFilter(
+        short filter,
+        ulong data)
+    {
+        ulong[]? wakeHandles = null;
+        var wakeHandleCount = 0;
+        var triggeredCount = 0;
+        lock (_eventQueueGate)
+        {
+            var registrationCapacity = 0;
+            foreach (var registrations in _registeredEvents.Values)
             {
-                WakeEventQueue(handle);
+                registrationCapacity += registrations.Count;
             }
+
+            wakeHandles = GC.AllocateUninitializedArray<ulong>(registrationCapacity);
+            foreach (var (handle, registrations) in _registeredEvents)
+            {
+                foreach (var registration in registrations.Values)
+                {
+                    if (registration.Filter != filter)
+                    {
+                        continue;
+                    }
+
+                    if (!_pendingEvents.TryGetValue(handle, out var queue))
+                    {
+                        queue = new LinkedList<KernelQueuedEvent>();
+                        _pendingEvents[handle] = queue;
+                    }
+
+                    QueueOrUpdateEvent(
+                        queue,
+                        new KernelQueuedEvent(
+                            registration.Ident,
+                            registration.Filter,
+                            0,
+                            1,
+                            data,
+                            registration.UserData));
+                    wakeHandles[wakeHandleCount++] = handle;
+                    triggeredCount++;
+                }
+            }
+
+            if (triggeredCount != 0)
+            {
+                Monitor.PulseAll(_eventQueueGate);
+            }
+        }
+
+        for (var i = 0; i < wakeHandleCount; i++)
+        {
+            WakeEventQueue(wakeHandles![i]);
         }
 
         return triggeredCount;

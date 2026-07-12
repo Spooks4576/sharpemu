@@ -144,7 +144,10 @@ public static class KernelMemoryCompatExports
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool VirtualProtect(nint lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect);
+    private static extern bool WindowsVirtualProtect(nint lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int mprotect(nint addr, nuint len, int prot);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern nint VirtualAlloc(nint lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
@@ -4500,12 +4503,22 @@ public static class KernelMemoryCompatExports
             if (guestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase))
             {
                 var relative = NormalizeMountRelativePath(guestPath["/app0/".Length..]);
+                if (TryResolveApp0WritableOverlayPath(relative, out var overlayPath))
+                {
+                    return overlayPath;
+                }
+
                 return Path.Combine(app0Root, relative);
             }
 
             if (guestPath.StartsWith("app0/", StringComparison.OrdinalIgnoreCase))
             {
                 var relative = NormalizeMountRelativePath(guestPath["app0/".Length..]);
+                if (TryResolveApp0WritableOverlayPath(relative, out var overlayPath))
+                {
+                    return overlayPath;
+                }
+
                 return Path.Combine(app0Root, relative);
             }
 
@@ -4519,6 +4532,19 @@ public static class KernelMemoryCompatExports
         }
 
         return guestPath;
+    }
+
+    private static bool TryResolveApp0WritableOverlayPath(string relativePath, out string hostPath)
+    {
+        var normalizedRelativePath = NormalizeMountRelativePath(relativePath);
+        if (PathContainsWritableOverlaySegment(normalizedRelativePath, Path.DirectorySeparatorChar))
+        {
+            hostPath = Path.Combine(GetPerAppWritableRoot(), "app0", normalizedRelativePath);
+            return true;
+        }
+
+        hostPath = string.Empty;
+        return false;
     }
 
     private static bool TryResolveRegisteredGuestMount(string guestPath, out string hostPath)
@@ -4726,7 +4752,40 @@ public static class KernelMemoryCompatExports
         var normalized = NormalizeGuestStatCachePath(guestPath);
         return normalized is not null &&
                (string.Equals(normalized, "/app0", StringComparison.OrdinalIgnoreCase) ||
-                normalized.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase));
+                (normalized.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase) &&
+                 !IsApp0WritableOverlayPath(normalized)));
+    }
+
+    private static bool IsApp0WritableOverlayPath(string normalizedGuestPath)
+    {
+        var relativePath = normalizedGuestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase)
+            ? normalizedGuestPath["/app0/".Length..]
+            : normalizedGuestPath;
+        return PathContainsWritableOverlaySegment(relativePath, '/');
+    }
+
+    private static bool PathContainsWritableOverlaySegment(string path, char separator)
+    {
+        var segmentStart = 0;
+        for (var i = 0; i <= path.Length; i++)
+        {
+            if (i != path.Length && path[i] != separator)
+            {
+                continue;
+            }
+
+            var segmentLength = i - segmentStart;
+            if (segmentLength != 0 &&
+                (string.Compare(path, segmentStart, "saved", 0, segmentLength, StringComparison.OrdinalIgnoreCase) == 0 ||
+                 string.Compare(path, segmentStart, "intermediate", 0, segmentLength, StringComparison.OrdinalIgnoreCase) == 0))
+            {
+                return true;
+            }
+
+            segmentStart = i + 1;
+        }
+
+        return false;
     }
 
     private static bool TryReadCString(CpuContext ctx, ulong address, ulong maxLength, out byte[] bytes)
@@ -4754,32 +4813,10 @@ public static class KernelMemoryCompatExports
         }
 
         const int maxChunkSize = 4096;
-        const int inlineChunkSize = 256;
-        Span<byte> inlineChunk = stackalloc byte[inlineChunkSize];
-        var firstPageRemaining = maxChunkSize - (int)(address & (maxChunkSize - 1));
-        var firstReadLength = Math.Min(limit, Math.Min(inlineChunkSize, firstPageRemaining));
-        var firstSpan = inlineChunk[..firstReadLength];
-        ulong offset = 0;
-        if (TryReadCompat(ctx, address, firstSpan))
-        {
-            var nulIndex = firstSpan.IndexOf((byte)0);
-            if (nulIndex >= 0)
-            {
-                bytes = firstSpan[..nulIndex].ToArray();
-                return true;
-            }
-
-            offset = unchecked((ulong)firstReadLength);
-        }
-
+        var buffer = GC.AllocateUninitializedArray<byte>(limit);
         var chunk = GC.AllocateUninitializedArray<byte>(Math.Min(maxChunkSize, limit));
-        var writer = new ArrayBufferWriter<byte>(Math.Min(limit, 256));
-        if (offset != 0)
-        {
-            firstSpan.CopyTo(writer.GetSpan(firstReadLength));
-            writer.Advance(firstReadLength);
-        }
-
+        var count = 0;
+        ulong offset = 0;
         while (offset < (ulong)limit)
         {
             var current = address + offset;
@@ -4793,18 +4830,16 @@ public static class KernelMemoryCompatExports
             var span = chunk.AsSpan(0, remaining);
             if (TryReadCompat(ctx, current, span))
             {
-                var nulIndex = span.IndexOf((byte)0);
-                var copyLength = nulIndex >= 0 ? nulIndex : remaining;
-                if (copyLength > 0)
+                for (var i = 0; i < remaining; i++)
                 {
-                    span[..copyLength].CopyTo(writer.GetSpan(copyLength));
-                    writer.Advance(copyLength);
-                }
+                    var value = chunk[i];
+                    if (value == 0)
+                    {
+                        bytes = TrimBytes(buffer, count);
+                        return true;
+                    }
 
-                if (nulIndex >= 0)
-                {
-                    bytes = writer.WrittenSpan.ToArray();
-                    return true;
+                    buffer[count++] = value;
                 }
 
                 offset += (ulong)remaining;
@@ -4819,17 +4854,37 @@ public static class KernelMemoryCompatExports
 
             if (one[0] == 0)
             {
-                bytes = writer.WrittenSpan.ToArray();
+                bytes = TrimBytes(buffer, count);
                 return true;
             }
 
-            one.CopyTo(writer.GetSpan(1));
-            writer.Advance(1);
+            buffer[count++] = one[0];
             offset++;
         }
 
-        bytes = writer.WrittenSpan.ToArray();
+        bytes = TrimBytes(buffer, count);
         return true;
+    }
+
+    private static byte[] TrimBytes(byte[] buffer, int length)
+    {
+        if (length == buffer.Length)
+        {
+            return buffer;
+        }
+
+        if (length == 0)
+        {
+            return [];
+        }
+
+        var trimmed = GC.AllocateUninitializedArray<byte>(length);
+        for (var i = 0; i < length; i++)
+        {
+            trimmed[i] = buffer[i];
+        }
+
+        return trimmed;
     }
 
     private static bool TryCompareStrings(CpuContext ctx, ulong left, ulong right, ulong limit, out int compare)
@@ -4871,7 +4926,7 @@ public static class KernelMemoryCompatExports
         }
 
         var limit = (int)Math.Min(maxLength, 1_048_576UL);
-        var buffer = new List<ushort>(Math.Min(limit, 256));
+        var buffer = GC.AllocateUninitializedArray<ushort>(limit);
         for (var i = 0; i < limit; i++)
         {
             if (!TryReadUInt16Compat(ctx, address + ((ulong)i * WideCharSize), out var unit))
@@ -4881,14 +4936,14 @@ public static class KernelMemoryCompatExports
 
             if (unit == 0)
             {
-                units = buffer.ToArray();
+                units = TrimWideUnits(buffer, i);
                 return true;
             }
 
-            buffer.Add(unit);
+            buffer[i] = unit;
         }
 
-        units = buffer.ToArray();
+        units = buffer;
         return true;
     }
 
@@ -4902,7 +4957,7 @@ public static class KernelMemoryCompatExports
         }
 
         var limit = (int)Math.Min(maxLength, 1_048_576UL);
-        var buffer = new List<ushort>(Math.Min(limit, 256));
+        var buffer = GC.AllocateUninitializedArray<ushort>(limit);
         for (var i = 0; i < limit; i++)
         {
             if (!TryReadUInt16Compat(ctx, address + ((ulong)i * WideCharSize), out var unit))
@@ -4913,15 +4968,36 @@ public static class KernelMemoryCompatExports
             if (unit == 0)
             {
                 terminated = true;
-                units = buffer.ToArray();
+                units = TrimWideUnits(buffer, i);
                 return true;
             }
 
-            buffer.Add(unit);
+            buffer[i] = unit;
         }
 
-        units = buffer.ToArray();
+        units = buffer;
         return true;
+    }
+
+    private static ushort[] TrimWideUnits(ushort[] buffer, int length)
+    {
+        if (length == buffer.Length)
+        {
+            return buffer;
+        }
+
+        if (length == 0)
+        {
+            return [];
+        }
+
+        var trimmed = GC.AllocateUninitializedArray<ushort>(length);
+        for (var i = 0; i < length; i++)
+        {
+            trimmed[i] = buffer[i];
+        }
+
+        return trimmed;
     }
 
     private static bool TryCompareWideStrings(CpuContext ctx, ulong left, ulong right, ulong limit, out int compare)
@@ -5461,13 +5537,35 @@ public static class KernelMemoryCompatExports
         }
 
         var hostProtection = ResolveHostProtection(orbisProtection);
-        if (!VirtualProtect((nint)address, (nuint)length, hostProtection, out _))
+        if (!ProtectHostMemory((nint)address, (nuint)length, hostProtection))
         {
             return false;
         }
 
         return true;
     }
+
+    private static bool ProtectHostMemory(nint address, nuint length, uint protection)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return WindowsVirtualProtect(address, length, protection, out _);
+        }
+
+        return mprotect(address, length, ToUnixProtection(protection)) == 0;
+    }
+
+    private static int ToUnixProtection(uint protection) =>
+        protection switch
+        {
+            HostPageNoAccess => 0,
+            HostPageReadOnly => 1,
+            HostPageReadWrite => 1 | 2,
+            HostPageExecute => 4,
+            HostPageExecuteRead => 1 | 4,
+            HostPageExecuteReadWrite => 1 | 2 | 4,
+            _ => 1 | 2
+        };
 
     private static uint ResolveHostProtection(int orbisProtection)
     {

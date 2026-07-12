@@ -20,6 +20,12 @@ public sealed partial class DirectExecutionBackend
 
 	private unsafe void SetupExceptionHandler()
 	{
+		if (!OperatingSystem.IsWindows())
+		{
+			InstallUnixSignalHandlers();
+			return;
+		}
+
 		if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_RAW_HANDLER"), "1", StringComparison.Ordinal))
 		{
 			_rawExceptionHandlerStub = CreateExceptionHandlerTrampoline(RawVectoredHandlerPtrManaged);
@@ -934,6 +940,35 @@ public sealed partial class DirectExecutionBackend
 		ulong committedBase = 0;
 		ulong committedSize = 0;
 
+		if (mbi.State == 4096)
+		{
+			if (TryGetLazyCommitWindow(faultAddress, mbi.BaseAddress, mbi.RegionSize, out var protectWindowBase, out var protectWindowSize) &&
+				TryCommitRange(protectWindowBase, protectWindowSize, commitProtect))
+			{
+				committed = true;
+				committedBase = protectWindowBase;
+				committedSize = protectWindowSize;
+			}
+			else if (TryCommitRange(pageBase, 4096uL, commitProtect))
+			{
+				committed = true;
+				committedBase = pageBase;
+				committedSize = 4096uL;
+			}
+
+			if (!committed)
+			{
+				return false;
+			}
+
+			TryCommitRange(pageBase + 4096, 4096uL, commitProtect);
+			if (traceLazyCommit)
+			{
+				Console.Error.WriteLine($"[LOADER][TRACE] lazy-protect#{traceIndex}: addr=0x{committedBase:X16} size=0x{committedSize:X16} access={accessType} protect=0x{commitProtect:X8}");
+			}
+			return true;
+		}
+
 		if (mbi.State == 65536)
 		{
 			if (TryGetLazyCommitWindow(faultAddress, mbi.BaseAddress, mbi.RegionSize, out var windowBase, out var windowSize) &&
@@ -964,6 +999,12 @@ public sealed partial class DirectExecutionBackend
 					committedSize = 65536uL;
 				}
 				else if (TryReserveThenCommit(pageBase, 4096uL, pageBase, 4096uL, commitProtect))
+				{
+					committed = true;
+					committedBase = pageBase;
+					committedSize = 4096uL;
+				}
+				else if (!OperatingSystem.IsWindows() && TryReserveThenCommitReplace(pageBase, 4096uL, pageBase, 4096uL, commitProtect))
 				{
 					committed = true;
 					committedBase = pageBase;
@@ -1101,6 +1142,16 @@ public sealed partial class DirectExecutionBackend
 				return false;
 			}
 			return TryCommitRange(commitAddress, commitSize, protection);
+		}
+
+		static unsafe bool TryReserveThenCommitReplace(ulong reserveAddress, ulong reserveSize, ulong commitAddress, ulong commitSize, uint protection)
+		{
+			if (reserveAddress != commitAddress || reserveSize != commitSize)
+			{
+				return false;
+			}
+
+			return VirtualAllocFixedReplace((void*)reserveAddress, (nuint)reserveSize, 4096u | 8192u, protection) != null;
 		}
 
 		static bool IsAccessCompatible(ulong accessType, uint protection)

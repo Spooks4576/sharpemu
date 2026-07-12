@@ -54,6 +54,8 @@ public static class AgcExports
     private const uint RDmaData = 0x19;
     private const uint SpiShaderPgmLoPs = 0x8;
     private const uint SpiShaderPgmHiPs = 0x9;
+    private const uint SpiShaderPgmLoGs = 0x8A;
+    private const uint SpiShaderPgmHiGs = 0x8B;
     private const uint SpiShaderPgmLoEs = 0xC8;
     private const uint SpiShaderPgmHiEs = 0xC9;
     private const uint SpiShaderPgmLoLs = 0x148;
@@ -2053,6 +2055,10 @@ public static class AgcExports
             DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
 
+        var triggeredEvents = KernelEventQueueCompatExports.TriggerRegisteredEventsByFilter(
+            KernelEventQueueCompatExports.KernelEventFilterGraphics,
+            commandAddress);
+        TraceAgc($"agc.driver_submit_dcb_complete events={triggeredEvents}");
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -2102,6 +2108,10 @@ public static class AgcExports
             DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
 
+        var triggeredEvents = KernelEventQueueCompatExports.TriggerRegisteredEventsByFilter(
+            KernelEventQueueCompatExports.KernelEventFilterGraphics,
+            commandAddress);
+        TraceAgc($"agc.driver_submit_acb_complete owner={ownerHandle} events={triggeredEvents}");
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -2983,10 +2993,8 @@ public static class AgcExports
         uint vertexCount,
         bool indexed)
     {
-        var hasExportShader = TryGetShaderAddress(
+        var hasExportShader = TryGetExportShaderAddress(
             state.ShRegisters,
-            SpiShaderPgmLoEs,
-            SpiShaderPgmHiEs,
             out var exportShaderAddress);
         var hasPixelShader = TryGetShaderAddress(
             state.ShRegisters,
@@ -4887,6 +4895,18 @@ public static class AgcExports
 
         address = ((ulong)hi << 40) | ((ulong)lo << 8);
         return address != 0;
+    }
+
+    private static bool TryGetExportShaderAddress(
+        IReadOnlyDictionary<uint, uint> registers,
+        out ulong address)
+    {
+        if (TryGetShaderAddress(registers, SpiShaderPgmLoGs, SpiShaderPgmHiGs, out address))
+        {
+            return true;
+        }
+
+        return TryGetShaderAddress(registers, SpiShaderPgmLoEs, SpiShaderPgmHiEs, out address);
     }
 
     private static bool TryReadTextureDescriptor(

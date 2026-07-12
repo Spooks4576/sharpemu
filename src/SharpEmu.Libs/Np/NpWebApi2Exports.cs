@@ -10,6 +10,7 @@ public static class NpWebApi2Exports
     private const int NpWebApi2ErrorInvalidArgument = unchecked((int)0x80553402);
 
     private static int _initialized;
+    private static int _nextPushEventHandle = 1;
 
     [SysAbiExport(
         Nid = "+o9816YQhqQ",
@@ -42,6 +43,24 @@ public static class NpWebApi2Exports
         Interlocked.Exchange(ref _initialized, 0);
         TraceNpWebApi2("term", libraryContextId, 0);
         return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "WV1GwM32NgY",
+        ExportName = "sceNpWebApi2PushEventCreateHandle",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpWebApi2")]
+    public static int NpWebApi2PushEventCreateHandle(CpuContext ctx)
+    {
+        var libraryContextId = unchecked((int)ctx[CpuRegister.Rdi]);
+        if (libraryContextId < 0)
+        {
+            return ctx.SetReturn(NpWebApi2ErrorInvalidArgument);
+        }
+
+        var handle = Interlocked.Increment(ref _nextPushEventHandle);
+        TraceNpWebApi2("push_event_create_handle", libraryContextId, (uint)handle);
+        return ctx.SetReturn(handle);
     }
 
     private static void TraceNpWebApi2(string operation, int id, ulong arg0)
