@@ -244,18 +244,24 @@ public sealed partial class DirectExecutionBackend
 
 		private static bool EnsureKernel32Exports()
 		{
+			// The native worker is Windows-only; the kernel32 imports are unresolvable elsewhere.
+			if (!OperatingSystem.IsWindows())
+			{
+				return false;
+			}
+
 			if (_exitThreadAddress != 0)
 			{
 				return _waitForSingleObjectAddress != 0 && _setEventAddress != 0;
 			}
-			nint kernel32 = GetModuleHandle("kernel32.dll");
+			nint kernel32 = WindowsGetModuleHandle("kernel32.dll");
 			if (kernel32 == 0)
 			{
 				return false;
 			}
-			_waitForSingleObjectAddress = GetProcAddress(kernel32, "WaitForSingleObject");
-			_setEventAddress = GetProcAddress(kernel32, "SetEvent");
-			_exitThreadAddress = GetProcAddress(kernel32, "ExitThread");
+			_waitForSingleObjectAddress = WindowsGetProcAddress(kernel32, "WaitForSingleObject");
+			_setEventAddress = WindowsGetProcAddress(kernel32, "SetEvent");
+			_exitThreadAddress = WindowsGetProcAddress(kernel32, "ExitThread");
 			return _waitForSingleObjectAddress != 0 && _setEventAddress != 0 && _exitThreadAddress != 0;
 		}
 
