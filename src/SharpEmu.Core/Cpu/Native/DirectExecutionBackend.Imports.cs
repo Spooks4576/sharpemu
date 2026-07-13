@@ -810,11 +810,8 @@ public sealed partial class DirectExecutionBackend
 			return !_logUsleep;
 		}
 
+		// Mutex/rwlock lock/unlock excluded: the leaf path can't block a contended lock.
 		return nid is
-			"9UK1vLZQft4" or // scePthreadMutexLock
-			"tn3VlD0hG60" or // scePthreadMutexUnlock
-			"7H0iTOciTLo" or // pthread_mutex_lock
-			"2Z+PpY6CaJg" or // pthread_mutex_unlock
 			"8aI7R7WaOlc" or // sceAmprCommandBufferConstructor
 			"zgXifHT9ErY" or // sceVideoOutIsFlipPending
 			"V++UgBtQhn0" or // sceAgcGetDataPacketPayloadAddress
@@ -888,12 +885,7 @@ public sealed partial class DirectExecutionBackend
 			"6ULAa0fq4jA" or // scePthreadRwlockInit
 			"1471ajPzxh0" or // pthread_rwlock_destroy
 			"BB+kb08Tl9A" or // scePthreadRwlockDestroy
-			"iGjsr1WAtI0" or // pthread_rwlock_rdlock
-			"Ox9i0c7L5w0" or // scePthreadRwlockRdlock
-			"sIlRvQqsN2Y" or // pthread_rwlock_wrlock
-			"mqdNorrB+gI" or // scePthreadRwlockWrlock
-			"EgmLo6EWgso" or // pthread_rwlock_unlock
-			"+L98PIbGttk" or // scePthreadRwlockUnlock
+			// rwlock rd/wr/unlock removed (can contend/block); init/destroy stay.
 			"aI+OeCz8xrQ" or // scePthreadSelf
 			"EotR8a3ASf4" or // pthread_self
 			"eoht7mQOCmo" or // scePthreadGetspecific
