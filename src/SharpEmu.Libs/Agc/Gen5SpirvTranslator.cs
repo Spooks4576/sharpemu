@@ -18,7 +18,8 @@ internal static partial class Gen5SpirvTranslator
         out string error,
         int globalBufferBase = 0,
         int totalGlobalBufferCount = -1,
-        int imageBindingBase = 0)
+        int imageBindingBase = 0,
+        int scalarRegisterBufferIndex = -1)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Pixel,
@@ -30,7 +31,8 @@ internal static partial class Gen5SpirvTranslator
             1,
             globalBufferBase,
             totalGlobalBufferCount,
-            imageBindingBase);
+            imageBindingBase,
+            scalarRegisterBufferIndex);
         return context.TryCompile(out shader, out error);
     }
 
@@ -41,7 +43,8 @@ internal static partial class Gen5SpirvTranslator
         out string error,
         int globalBufferBase = 0,
         int totalGlobalBufferCount = -1,
-        int imageBindingBase = 0)
+        int imageBindingBase = 0,
+        int scalarRegisterBufferIndex = -1)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Vertex,
@@ -53,7 +56,8 @@ internal static partial class Gen5SpirvTranslator
             1,
             globalBufferBase,
             totalGlobalBufferCount,
-            imageBindingBase);
+            imageBindingBase,
+            scalarRegisterBufferIndex);
         return context.TryCompile(out shader, out error);
     }
 
@@ -76,7 +80,8 @@ internal static partial class Gen5SpirvTranslator
             Math.Max(localSizeZ, 1),
             0,
             -1,
-            0);
+            0,
+            -1);
         return context.TryCompile(out shader, out error);
     }
 
@@ -93,6 +98,7 @@ internal static partial class Gen5SpirvTranslator
         private readonly int _globalBufferBase;
         private readonly int _totalGlobalBufferCount;
         private readonly int _imageBindingBase;
+        private readonly int _scalarRegisterBufferIndex;
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
         private readonly Dictionary<uint, uint> _vertexOutputs = [];
@@ -167,7 +173,8 @@ internal static partial class Gen5SpirvTranslator
             uint localSizeZ,
             int globalBufferBase,
             int totalGlobalBufferCount,
-            int imageBindingBase)
+            int imageBindingBase,
+            int scalarRegisterBufferIndex)
         {
             _stage = stage;
             _state = state;
@@ -181,6 +188,7 @@ internal static partial class Gen5SpirvTranslator
                 ? evaluation.GlobalMemoryBindings.Count
                 : totalGlobalBufferCount;
             _imageBindingBase = imageBindingBase;
+            _scalarRegisterBufferIndex = scalarRegisterBufferIndex;
         }
 
         public bool TryCompile(out Gen5SpirvShader shader, out string error)
@@ -767,15 +775,25 @@ internal static partial class Gen5SpirvTranslator
 
         private void EmitInitialState()
         {
-            for (uint index = 0;
-                 index < _evaluation.InitialScalarRegisters.Count &&
-                 index < ScalarRegisterCount;
-                 index++)
+            if (_scalarRegisterBufferIndex >= 0)
             {
-                var value = _evaluation.InitialScalarRegisters[(int)index];
-                if (value != 0)
+                for (uint index = 0; index < ScalarRegisterCount; index++)
                 {
-                    StoreS(index, UInt(value));
+                    StoreS(index, LoadBufferWord(_scalarRegisterBufferIndex, UInt(index)));
+                }
+            }
+            else
+            {
+                for (uint index = 0;
+                     index < _evaluation.InitialScalarRegisters.Count &&
+                     index < ScalarRegisterCount;
+                     index++)
+                {
+                    var value = _evaluation.InitialScalarRegisters[(int)index];
+                    if (value != 0)
+                    {
+                        StoreS(index, UInt(value));
+                    }
                 }
             }
 

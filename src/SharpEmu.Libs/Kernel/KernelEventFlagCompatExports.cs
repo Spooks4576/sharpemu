@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Fiber;
@@ -31,6 +32,11 @@ public static class KernelEventFlagCompatExports
         public ulong Bits { get; set; }
         public int WaitingThreads { get; set; }
         public object Gate { get; } = new();
+    }
+
+    private sealed class EventFlagWaiter
+    {
+        public OrbisGen2Result? Result { get; set; }
     }
 
     [SysAbiExport(
@@ -233,9 +239,47 @@ public static class KernelEventFlagCompatExports
 
             if (timeoutAddress != 0)
             {
+                if (timeoutUsec == 0)
+                {
+                    _ = ctx.TryWriteUInt32(timeoutAddress, 0);
+                    _ = TryWriteResultPattern(ctx, resultAddress, state.Bits);
+                    TraceEventFlag($"wait-timeout handle=0x{handle:X16} pattern=0x{pattern:X16} timeout=0 ret=0x{returnRip:X16}");
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
+                }
+
+                var deadline = GuestThreadExecution.ComputeDeadlineTimestamp(
+                    TimeSpan.FromTicks((long)timeoutUsec * 10L));
+                var timedWaiter = new EventFlagWaiter();
+                if (GuestThreadExecution.RequestCurrentThreadBlock(
+                        ctx,
+                        "sceKernelWaitEventFlag",
+                        GetEventFlagWakeKey(handle),
+                        resumeHandler: () => CompleteBlockedTimedWait(
+                            ctx,
+                            state,
+                            timedWaiter,
+                            pattern,
+                            waitMode,
+                            resultAddress,
+                            timeoutAddress,
+                            deadline),
+                        wakeHandler: () => TryCompleteBlockedTimedWait(
+                            ctx,
+                            state,
+                            timedWaiter,
+                            pattern,
+                            waitMode,
+                            resultAddress),
+                        blockDeadlineTimestamp: deadline))
+                {
+                    state.WaitingThreads++;
+                    TraceEventFlag($"wait-block-timed handle=0x{handle:X16} pattern=0x{pattern:X16} timeout={timeoutUsec} waiters={state.WaitingThreads} ret=0x{returnRip:X16}");
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+                }
+
                 _ = ctx.TryWriteUInt32(timeoutAddress, 0);
                 _ = TryWriteResultPattern(ctx, resultAddress, state.Bits);
-                TraceEventFlag($"wait-timeout handle=0x{handle:X16} pattern=0x{pattern:X16} timeout={timeoutUsec} ret=0x{returnRip:X16}");
+                TraceEventFlag($"wait-timeout-host handle=0x{handle:X16} pattern=0x{pattern:X16} timeout={timeoutUsec} ret=0x{returnRip:X16}");
                 return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
             }
 
@@ -444,6 +488,92 @@ public static class KernelEventFlagCompatExports
                 $"wait-wake pattern=0x{pattern:X16} mode=0x{waitMode:X2} bits=0x{state.Bits:X16} waiters={state.WaitingThreads}");
             return true;
         }
+    }
+
+    private static bool TryCompleteBlockedTimedWait(
+        CpuContext ctx,
+        EventFlagState state,
+        EventFlagWaiter waiter,
+        ulong pattern,
+        uint waitMode,
+        ulong resultAddress)
+    {
+        lock (state.Gate)
+        {
+            if (waiter.Result is not null)
+            {
+                return true;
+            }
+
+            if (!IsSatisfied(state.Bits, pattern, waitMode))
+            {
+                return false;
+            }
+
+            waiter.Result = TryWriteResultPattern(ctx, resultAddress, state.Bits)
+                ? OrbisGen2Result.ORBIS_GEN2_OK
+                : OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            if (waiter.Result == OrbisGen2Result.ORBIS_GEN2_OK)
+            {
+                ApplyClearMode(state, pattern, waitMode);
+            }
+
+            state.WaitingThreads = Math.Max(0, state.WaitingThreads - 1);
+            return true;
+        }
+    }
+
+    private static int CompleteBlockedTimedWait(
+        CpuContext ctx,
+        EventFlagState state,
+        EventFlagWaiter waiter,
+        ulong pattern,
+        uint waitMode,
+        ulong resultAddress,
+        ulong timeoutAddress,
+        long deadlineTimestamp)
+    {
+        lock (state.Gate)
+        {
+            if (waiter.Result is null)
+            {
+                if (IsSatisfied(state.Bits, pattern, waitMode))
+                {
+                    waiter.Result = TryWriteResultPattern(ctx, resultAddress, state.Bits)
+                        ? OrbisGen2Result.ORBIS_GEN2_OK
+                        : OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                    if (waiter.Result == OrbisGen2Result.ORBIS_GEN2_OK)
+                    {
+                        ApplyClearMode(state, pattern, waitMode);
+                    }
+                }
+                else
+                {
+                    waiter.Result = TryWriteResultPattern(ctx, resultAddress, state.Bits)
+                        ? OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT
+                        : OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+
+                state.WaitingThreads = Math.Max(0, state.WaitingThreads - 1);
+            }
+        }
+
+        if (waiter.Result == OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            var remainingTicks = deadlineTimestamp - Stopwatch.GetTimestamp();
+            var remainingMicros = remainingTicks <= 0
+                ? 0u
+                : (uint)Math.Min(
+                    uint.MaxValue,
+                    remainingTicks / (double)Stopwatch.Frequency * 1_000_000d);
+            _ = ctx.TryWriteUInt32(timeoutAddress, remainingMicros);
+        }
+        else
+        {
+            _ = ctx.TryWriteUInt32(timeoutAddress, 0);
+        }
+
+        return (int)waiter.Result.Value;
     }
 
     private static string GetEventFlagWakeKey(ulong handle) =>
