@@ -422,6 +422,17 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
                       <Grid ColumnDefinitions="*,Auto">
                         <StackPanel VerticalAlignment="Center" Spacing="2" Margin="0,0,16,0">
+                          <TextBlock Text="SHARPEMU_WRITABLE_APP0" FontSize="13" FontFamily="Consolas,monospace" />
+                          <TextBlock x:Name="EnvWritableApp0Desc"
+                                     Text="Allow titles to create and write files inside their install folder.&#10;Needed by unpackaged dumps that write their save or config data under /app0."
+                                     FontSize="11" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" />
+                        </StackPanel>
+                        <ToggleSwitch Grid.Column="1" x:Name="EnvWritableApp0Toggle" OnContent="On" OffContent="Off"
+                                      VerticalAlignment="Center" />
+                      </Grid>
+
+                      <Grid ColumnDefinitions="*,Auto">
+                        <StackPanel VerticalAlignment="Center" Spacing="2" Margin="0,0,16,0">
                           <TextBlock Text="SHARPEMU_VK_VALIDATION" FontSize="13" FontFamily="Consolas,monospace" />
                           <TextBlock x:Name="EnvVkValidationDesc"
                                      Text="Enable Vulkan validation layers for GPU debugging.&#10;Slow. Requires the Vulkan SDK to be installed."
@@ -450,6 +461,17 @@ SPDX-License-Identifier: GPL-2.0-or-later
                                      FontSize="11" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" />
                         </StackPanel>
                         <ToggleSwitch Grid.Column="1" x:Name="EnvLogDirectMemoryToggle" OnContent="On" OffContent="Off"
+                                      VerticalAlignment="Center" />
+                      </Grid>
+
+                      <Grid ColumnDefinitions="*,Auto">
+                        <StackPanel VerticalAlignment="Center" Spacing="2" Margin="0,0,16,0">
+                          <TextBlock Text="SHARPEMU_LOG_IO" FontSize="13" FontFamily="Consolas,monospace" />
+                          <TextBlock x:Name="EnvLogIoDesc"
+                                     Text="Log file open, read, and path-resolve activity to the console.&#10;Use when a game cannot find its data files during boot."
+                                     FontSize="11" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" />
+                        </StackPanel>
+                        <ToggleSwitch Grid.Column="1" x:Name="EnvLogIoToggle" OnContent="On" OffContent="Off"
                                       VerticalAlignment="Center" />
                       </Grid>
 

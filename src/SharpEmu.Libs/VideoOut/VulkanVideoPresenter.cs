@@ -4160,6 +4160,48 @@ internal static unsafe class VulkanVideoPresenter
                 _submitTimeline;
         }
 
+        private void TransitionNewGuestImageToSampled(Image image, uint mipLevels)
+        {
+            var commandBuffer = AllocateGuestCommandBuffer();
+            var beginInfo = new CommandBufferBeginInfo
+            {
+                SType = StructureType.CommandBufferBeginInfo,
+                Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+            };
+            Check(
+                _vk.BeginCommandBuffer(commandBuffer, &beginInfo),
+                "vkBeginCommandBuffer(guest image init)");
+            var barrier = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = 0,
+                DstAccessMask = AccessFlags.ShaderReadBit,
+                OldLayout = ImageLayout.Undefined,
+                NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = image,
+                SubresourceRange = ColorSubresourceRange(0, mipLevels),
+            };
+            _vk.CmdPipelineBarrier(
+                commandBuffer,
+                PipelineStageFlags.TopOfPipeBit,
+                PipelineStageFlags.AllCommandsBit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                &barrier);
+            Check(
+                _vk.EndCommandBuffer(commandBuffer),
+                "vkEndCommandBuffer(guest image init)");
+            // Same-queue submission order makes the transition visible to any
+            // later use of the image; no CPU-side wait is needed.
+            SubmitGuestCommandBuffer(commandBuffer, [], []);
+        }
+
         private void EnsureGuestSubmissionCapacity()
         {
             CollectCompletedGuestSubmissions(waitForOldest: false);
@@ -8300,7 +8342,7 @@ internal static unsafe class VulkanVideoPresenter
             return (properties.OptimalTilingFeatures & FormatFeatureFlags.ColorAttachmentBit) != 0;
         }
 
-        private static Format GetTextureFormat(uint format, uint numberType) =>
+        internal static Format GetTextureFormat(uint format, uint numberType) =>
             (format, numberType) switch
             {
                 (9, _) => Format.A2B10G10R10UnormPack32,
@@ -10170,6 +10212,9 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.AllocateMemory(_device, &allocationInfo, null, out var memory),
                 "vkAllocateMemory(offscreen)");
             Check(_vk.BindImageMemory(_device, image, memory, 0), "vkBindImageMemory(offscreen)");
+            // Rendering and uploads only define the mips they touch; define the whole
+            // chain once so full-chain sampled binds never read Undefined layout.
+            TransitionNewGuestImageToSampled(image, mipLevels);
 
             var viewInfo = new ImageViewCreateInfo
             {
@@ -10937,7 +10982,7 @@ internal static unsafe class VulkanVideoPresenter
             return view;
         }
 
-        private static bool IsCompatibleViewFormat(Format imageFormat, Format viewFormat)
+        internal static bool IsCompatibleViewFormat(Format imageFormat, Format viewFormat)
         {
             if (imageFormat == viewFormat)
             {

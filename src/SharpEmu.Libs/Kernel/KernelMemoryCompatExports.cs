@@ -4806,8 +4806,19 @@ public static partial class KernelMemoryCompatExports
     private static bool IsMutatingOpen(int flags) =>
         (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) != 0;
 
+    // Dev-build dumps (unpackaged UE titles, etc.) may write their Saved/ tree under
+    // /app0, which is read-only on retail hardware. Opt in via SHARPEMU_WRITABLE_APP0=1
+    // to allow those writes so such dumps can boot; defaults off to keep retail semantics.
+    private static readonly bool _writableApp0 =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_WRITABLE_APP0"), "1", StringComparison.Ordinal);
+
     public static bool IsReadOnlyGuestMutationPath(string guestPath)
     {
+        if (_writableApp0)
+        {
+            return false;
+        }
+
         var normalized = NormalizeGuestStatCachePath(guestPath);
         return normalized is not null &&
                (string.Equals(normalized, "/app0", StringComparison.OrdinalIgnoreCase) ||
