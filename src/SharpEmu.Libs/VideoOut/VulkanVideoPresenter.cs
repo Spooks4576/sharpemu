@@ -4262,23 +4262,43 @@ internal static unsafe class VulkanVideoPresenter
                     return;
                 }
 
-                Check(result, $"vkWaitForFences(guest: {oldest.DebugName})");
+                if (result == Result.ErrorDeviceLost)
+                {
+                    _deviceLost = true;
+                }
+                else
+                {
+                    Check(result, $"vkWaitForFences(guest: {oldest.DebugName})");
+                }
             }
 
             while (_pendingGuestSubmissions.TryPeek(out var submission))
             {
                 var status = _vk.GetFenceStatus(_device, submission.Fence);
-                if (status == Result.NotReady)
+                if (status == Result.NotReady && !_deviceLost)
                 {
                     break;
                 }
 
-                Check(status, $"vkGetFenceStatus(guest: {submission.DebugName})");
+                if (status == Result.ErrorDeviceLost)
+                {
+                    // Pending fences never signal on a lost device; retire the
+                    // submission anyway so teardown and back-pressure survive.
+                    _deviceLost = true;
+                }
+                else if (status != Result.NotReady)
+                {
+                    Check(status, $"vkGetFenceStatus(guest: {submission.DebugName})");
+                }
+
                 _pendingGuestSubmissions.Dequeue();
 
-                foreach (var image in submission.TraceImages)
+                if (!_deviceLost)
                 {
-                    TraceGuestImageContents(image);
+                    foreach (var image in submission.TraceImages)
+                    {
+                        TraceGuestImageContents(image);
+                    }
                 }
 
                 foreach (var resources in submission.Resources)
@@ -4556,12 +4576,19 @@ internal static unsafe class VulkanVideoPresenter
                 $"queue={_activeGuestQueue.Name} submission={_activeGuestQueue.SubmissionId} " +
                 $"handle={work.VideoOutHandle} index={work.DisplayBufferIndex} " +
                 $"capture_complete={(captured ? 1 : 0)}");
-#if DEBUG
-            System.Diagnostics.Debug.Assert(
-                work.Version == 0 || captured,
-                "An ordered wait-safe marker must execute after its flip capture.");
-#endif
+            // Demon's Souls executes wait-safe markers before their flip capture;
+            // an assert here would fail-fast the process, so warn once instead.
+            // Dedup on a flag, not the (per-frame-unique) version, to bound growth.
+            if (work.Version != 0 && !captured && !_loggedFlipWaitOrderViolation)
+            {
+                _loggedFlipWaitOrderViolation = true;
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] vk.flip_wait_order version={work.Version} " +
+                    "executed before its flip capture; continuing.");
+            }
         }
+
+        private bool _loggedFlipWaitOrderViolation;
 
         private GuestImageResource CreateGuestFlipSnapshot(
             GuestImageResource source,
@@ -11049,6 +11076,23 @@ internal static unsafe class VulkanVideoPresenter
 
         private void Render(double _)
         {
+            try
+            {
+                RenderCore();
+            }
+            catch (Exception exception)
+            {
+                // Device loss can strike between any two Vulkan calls in the frame;
+                // keep the window loop pumping instead of tearing the presenter down.
+                if (!TryMarkDeviceLost(exception))
+                {
+                    throw;
+                }
+            }
+        }
+
+        private void RenderCore()
+        {
             if (Volatile.Read(ref _presenterCloseRequested))
             {
                 Console.Error.WriteLine("[LOADER][WARN] Vulkan VideoOut closing on host shutdown request.");
@@ -11058,6 +11102,18 @@ internal static unsafe class VulkanVideoPresenter
 
             if (!_vulkanReady)
             {
+                return;
+            }
+
+            if (_deviceLost)
+            {
+                // Drain queued work so producers aren't back-pressured, then
+                // return without any Vulkan call (fences never signal post-loss).
+                while (TryTakeGuestWork(out var lostWork))
+                {
+                    CompleteGuestWork(lostWork);
+                }
+
                 return;
             }
 
@@ -13881,20 +13937,38 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            if (result == Result.ErrorDeviceLost)
+            {
+                throw new VulkanDeviceLostException(operation);
+            }
+
             throw new InvalidOperationException($"{operation} failed with {result}.");
         }
 
         private static void Check(Result result, string operation)
         {
+            if (result == Result.ErrorDeviceLost)
+            {
+                throw new VulkanDeviceLostException(operation);
+            }
+
             if (result != Result.Success)
             {
                 throw new InvalidOperationException($"{operation} failed with {result}.");
             }
         }
 
+        // Typed so the frame-boundary catch can recognize device loss without
+        // depending on the exact wording of the exception message.
+        private sealed class VulkanDeviceLostException(string operation)
+            : InvalidOperationException($"{operation} failed with {Result.ErrorDeviceLost}.");
+
         private bool TryMarkDeviceLost(Exception exception)
         {
-            if (!exception.Message.Contains(nameof(Result.ErrorDeviceLost), StringComparison.Ordinal))
+            // Prefer the typed signal; fall back to the message for losses that
+            // surface through other layers (e.g. Silk.NET bindings).
+            if (exception is not VulkanDeviceLostException &&
+                !exception.Message.Contains(nameof(Result.ErrorDeviceLost), StringComparison.Ordinal))
             {
                 return false;
             }
