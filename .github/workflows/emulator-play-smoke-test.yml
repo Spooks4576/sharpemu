@@ -1,0 +1,86 @@
+name: Emulator play smoke test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emulator-play-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  play-smoke-test:
+    name: Boot known game
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      BASE_GAME_URL: ${{ secrets.BASE_GAME_URL }}
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      DOTNET_NOLOGO: 1
+      LIBGL_ALWAYS_SOFTWARE: 1
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Install virtual display and software Vulkan
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            curl unzip xvfb x11-utils xdotool imagemagick mesa-vulkan-drivers libglfw3
+
+      - name: Verify game download secret
+        run: |
+          if [[ -z "$BASE_GAME_URL" ]]; then
+            echo "::error::Set the repository secret BASE_GAME_URL to the authorized game ZIP URL."
+            exit 1
+          fi
+
+      - name: Download and extract base game
+        run: |
+          mkdir -p "$RUNNER_TEMP/base-game"
+          curl --fail --location --silent --show-error \
+            --retry 3 --output "$RUNNER_TEMP/base-game.zip" "$BASE_GAME_URL"
+          unzip -q "$RUNNER_TEMP/base-game.zip" -d "$RUNNER_TEMP/base-game"
+
+          eboot_path="$(find "$RUNNER_TEMP/base-game" -type f -iname eboot.bin -print -quit)"
+          if [[ -z "$eboot_path" ]]; then
+            echo "::error::The base-game archive does not contain an eboot.bin file."
+            exit 1
+          fi
+          echo "EBOOT_PATH=$eboot_path" >> "$GITHUB_ENV"
+
+      - name: Publish emulator
+        run: >-
+          dotnet publish src/SharpEmu.CLI/SharpEmu.CLI.csproj
+          --configuration Release
+          --runtime linux-x64
+          --no-self-contained
+          --output "$RUNNER_TEMP/sharpemu"
+
+      - name: Exercise emulator play
+        run: scripts/ci/emulator-smoke-test.sh "$RUNNER_TEMP/sharpemu/SharpEmu" "$EBOOT_PATH"
+
+      - name: Upload emulator smoke-test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-play-evidence-${{ github.run_attempt }}
+          path: |
+            artifacts/emulator-smoke/emulator.log
+            artifacts/emulator-smoke/game-screenshot.png
+            artifacts/emulator-smoke/xvfb.log
+          if-no-files-found: warn
+          retention-days: 14
