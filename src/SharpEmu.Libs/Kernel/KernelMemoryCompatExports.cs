@@ -1574,7 +1574,27 @@ public static partial class KernelMemoryCompatExports
         ExportName = "stat",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libc")]
-    public static int PosixStat(CpuContext ctx) => KernelStat(ctx);
+    public static int PosixStat(CpuContext ctx)
+    {
+        var result = KernelStat(ctx);
+        if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            return 0;
+        }
+
+        // stat(2) follows the libc/POSIX ABI: failures return -1 and expose
+        // the reason through errno. Returning the raw Orbis kernel code here
+        // makes callers treat a missing file as a non-negative success value.
+        var errno = result switch
+        {
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT => Einval,
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT => Efault,
+            _ => 2, // ENOENT
+        };
+        KernelRuntimeCompatExports.TrySetErrno(ctx, errno);
+        ctx[CpuRegister.Rax] = ulong.MaxValue;
+        return -1;
+    }
 
     [SysAbiExport(
         Nid = "gEpBkcwxUjw",
@@ -4219,31 +4239,50 @@ public static partial class KernelMemoryCompatExports
     {
         private readonly CpuContext _ctx;
         private int _gpIndex;
+        private int _fpIndex;
+        private int _stackIndex;
 
         public RegisterPrintfArgumentSource(CpuContext ctx, int gpIndex)
         {
             _ctx = ctx;
             _gpIndex = gpIndex;
+            _fpIndex = 0;
+            _stackIndex = 0;
         }
 
         public ulong NextGpArg()
         {
-            var index = _gpIndex++;
-            return index switch
+            var index = _gpIndex;
+            if (index < 6)
             {
-                0 => _ctx[CpuRegister.Rdi],
-                1 => _ctx[CpuRegister.Rsi],
-                2 => _ctx[CpuRegister.Rdx],
-                3 => _ctx[CpuRegister.Rcx],
-                4 => _ctx[CpuRegister.R8],
-                5 => _ctx[CpuRegister.R9],
-                _ => ReadStackArg(_ctx, (ulong)(index - 6) * 8)
-            };
+                _gpIndex++;
+                return index switch
+                {
+                    0 => _ctx[CpuRegister.Rdi],
+                    1 => _ctx[CpuRegister.Rsi],
+                    2 => _ctx[CpuRegister.Rdx],
+                    3 => _ctx[CpuRegister.Rcx],
+                    4 => _ctx[CpuRegister.R8],
+                    _ => _ctx[CpuRegister.R9],
+                };
+            }
+
+            return ReadStackArg(_ctx, (ulong)(_stackIndex++) * 8);
         }
 
         public double NextFloatArg()
         {
-            return BitConverter.Int64BitsToDouble(unchecked((long)NextGpArg()));
+            ulong bits;
+            if (_fpIndex < 8)
+            {
+                _ctx.GetXmmRegister(_fpIndex++, out bits, out _);
+            }
+            else
+            {
+                bits = ReadStackArg(_ctx, (ulong)(_stackIndex++) * 8);
+            }
+
+            return BitConverter.Int64BitsToDouble(unchecked((long)bits));
         }
     }
 
@@ -4806,8 +4845,19 @@ public static partial class KernelMemoryCompatExports
     private static bool IsMutatingOpen(int flags) =>
         (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) != 0;
 
+    // Dev-build dumps (unpackaged UE titles, etc.) may write their Saved/ tree under
+    // /app0, which is read-only on retail hardware. Opt in via SHARPEMU_WRITABLE_APP0=1
+    // to allow those writes so such dumps can boot; defaults off to keep retail semantics.
+    private static readonly bool _writableApp0 =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_WRITABLE_APP0"), "1", StringComparison.Ordinal);
+
     public static bool IsReadOnlyGuestMutationPath(string guestPath)
     {
+        if (_writableApp0)
+        {
+            return false;
+        }
+
         var normalized = NormalizeGuestStatCachePath(guestPath);
         return normalized is not null &&
                (string.Equals(normalized, "/app0", StringComparison.OrdinalIgnoreCase) ||
