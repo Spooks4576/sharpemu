@@ -4,6 +4,7 @@
 using SharpEmu.HLE;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace SharpEmu.Libs.Audio;
@@ -12,6 +13,7 @@ public static class AjmExports
 {
     private const int OrbisAjmErrorInvalidContext = unchecked((int)0x80930002);
     private const int OrbisAjmErrorInvalidInstance = unchecked((int)0x80930003);
+    private const int OrbisAjmErrorInvalidBatch = unchecked((int)0x80930004);
     private const int OrbisAjmErrorInvalidParameter = unchecked((int)0x80930005);
     private const int OrbisAjmErrorOutOfResources = unchecked((int)0x80930007);
     private const int OrbisAjmErrorCodecAlreadyRegistered = unchecked((int)0x80930009);
@@ -20,6 +22,9 @@ public static class AjmExports
     private const uint MaxCodecType = 23;
     private const int MaxInstanceIndex = 0x2FFF;
     private static readonly ConcurrentDictionary<uint, AjmContextState> Contexts = new();
+    private static readonly IReadOnlyDictionary<int, nint> ErrorStrings = CreateErrorStrings();
+    private static readonly nint UnknownErrorString =
+        Marshal.StringToHGlobalAnsi("SCE_AJM_ERROR_UNKNOWN");
     private static int _nextContextId;
 
     private sealed class AjmContextState
@@ -30,7 +35,11 @@ public static class AjmExports
 
         public Dictionary<uint, uint> InstancesBySlot { get; } = new();
 
+        public HashSet<uint> CompletedBatches { get; } = new();
+
         public int NextInstanceIndex { get; set; }
+
+        public uint NextBatchId { get; set; }
     }
 
     public static int AjmInitialize(CpuContext ctx)
@@ -227,6 +236,166 @@ public static class AjmExports
         return 0;
     }
 
+    [SysAbiExport(
+        Nid = "ezM2OhNxzck",
+        ExportName = "sceAjmBatchJobInitialize",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmBatchJobInitialize(CpuContext ctx)
+    {
+        var batchAddress = ctx[CpuRegister.Rdi];
+        var instanceId = unchecked((uint)ctx[CpuRegister.Rsi]);
+        if (batchAddress == 0)
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidParameter);
+        }
+
+        if (!IsLiveInstance(instanceId))
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidInstance);
+        }
+
+        // AJM jobs are consumed by Sony's audio co-processor. The HLE audio
+        // path does not submit those command payloads, but accepting a job for
+        // a live instance preserves the guest-side batch builder lifecycle.
+        Trace(
+            $"batch_job_initialize batch=0x{batchAddress:X16} " +
+            $"instance=0x{instanceId:X8}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "SkEwpiu3tZg",
+        ExportName = "sceAjmBatchJobSetGaplessDecode",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmBatchJobSetGaplessDecode(CpuContext ctx)
+    {
+        var batchAddress = ctx[CpuRegister.Rdi];
+        var instanceId = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var gaplessDecodeAddress = ctx[CpuRegister.Rdx];
+        var reset = unchecked((int)ctx[CpuRegister.Rcx]);
+        var resultAddress = ctx[CpuRegister.R8];
+        if (batchAddress == 0 || gaplessDecodeAddress == 0)
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidParameter);
+        }
+
+        if (!IsLiveInstance(instanceId))
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidInstance);
+        }
+
+        Span<byte> gaplessDecode = stackalloc byte[8];
+        if (!ctx.Memory.TryRead(gaplessDecodeAddress, gaplessDecode))
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidParameter);
+        }
+
+        if (resultAddress != 0)
+        {
+            Span<byte> result = stackalloc byte[8];
+            result.Clear();
+            if (!ctx.Memory.TryWrite(resultAddress, result))
+            {
+                return ctx.SetReturn(OrbisAjmErrorInvalidParameter);
+            }
+        }
+
+        Trace(
+            $"batch_job_set_gapless batch=0x{batchAddress:X16} " +
+            $"instance=0x{instanceId:X8} reset={reset}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "5tOfnaClcqM",
+        ExportName = "sceAjmBatchStart",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmBatchStart(CpuContext ctx)
+    {
+        var contextId = unchecked((uint)ctx[CpuRegister.Rdi]);
+        var batchAddress = ctx[CpuRegister.Rsi];
+        var priority = unchecked((int)ctx[CpuRegister.Rdx]);
+        var outputAddress = ctx[CpuRegister.R8];
+        if (!Contexts.TryGetValue(contextId, out var state))
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidContext);
+        }
+
+        if (batchAddress == 0 || outputAddress == 0)
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidParameter);
+        }
+
+        uint batchId;
+        lock (state.Gate)
+        {
+            do
+            {
+                batchId = ++state.NextBatchId;
+            }
+            while (batchId == 0 || state.CompletedBatches.Contains(batchId));
+
+            Span<byte> encodedId = stackalloc byte[sizeof(uint)];
+            BinaryPrimitives.WriteUInt32LittleEndian(encodedId, batchId);
+            if (!ctx.Memory.TryWrite(outputAddress, encodedId))
+            {
+                return ctx.SetReturn(OrbisAjmErrorInvalidParameter);
+            }
+
+            // AJM processing is synchronous in the HLE compatibility path,
+            // so a successfully submitted batch is immediately waitable.
+            state.CompletedBatches.Add(batchId);
+        }
+
+        Trace(
+            $"batch_start context={contextId} batch=0x{batchAddress:X16} " +
+            $"priority={priority} id={batchId}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "-qLsfDAywIY",
+        ExportName = "sceAjmBatchWait",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmBatchWait(CpuContext ctx)
+    {
+        var contextId = unchecked((uint)ctx[CpuRegister.Rdi]);
+        var batchId = unchecked((uint)ctx[CpuRegister.Rsi]);
+        if (!Contexts.TryGetValue(contextId, out var state))
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidContext);
+        }
+
+        lock (state.Gate)
+        {
+            if (!state.CompletedBatches.Remove(batchId))
+            {
+                return ctx.SetReturn(OrbisAjmErrorInvalidBatch);
+            }
+        }
+
+        Trace($"batch_wait context={contextId} id={batchId}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "AxhcqVv5AYU",
+        ExportName = "sceAjmStrError",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmStrError(CpuContext ctx)
+    {
+        var error = unchecked((int)ctx[CpuRegister.Rdi]);
+        ctx[CpuRegister.Rax] = unchecked((ulong)(ErrorStrings.TryGetValue(error, out var text)
+            ? text
+            : UnknownErrorString));
+        return 0;
+    }
+
     internal static void ResetForTests()
     {
         Contexts.Clear();
@@ -240,4 +409,44 @@ public static class AjmExports
             Console.Error.WriteLine($"[LOADER][TRACE] ajm.{message}");
         }
     }
+
+    private static bool IsLiveInstance(uint instanceId)
+    {
+        var instanceSlot = instanceId & 0x3FFF;
+        foreach (var state in Contexts.Values)
+        {
+            lock (state.Gate)
+            {
+                if (state.InstancesBySlot.TryGetValue(instanceSlot, out var liveInstance) &&
+                    liveInstance == instanceId)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static IReadOnlyDictionary<int, nint> CreateErrorStrings() =>
+        new Dictionary<int, nint>
+        {
+            [0] = Marshal.StringToHGlobalAnsi("SCE_AJM_OK"),
+            [OrbisAjmErrorInvalidContext] =
+                Marshal.StringToHGlobalAnsi("SCE_AJM_ERROR_INVALID_CONTEXT"),
+            [OrbisAjmErrorInvalidInstance] =
+                Marshal.StringToHGlobalAnsi("SCE_AJM_ERROR_INVALID_INSTANCE"),
+            [OrbisAjmErrorInvalidBatch] =
+                Marshal.StringToHGlobalAnsi("SCE_AJM_ERROR_INVALID_BATCH"),
+            [OrbisAjmErrorInvalidParameter] =
+                Marshal.StringToHGlobalAnsi("SCE_AJM_ERROR_INVALID_PARAMETER"),
+            [OrbisAjmErrorOutOfResources] =
+                Marshal.StringToHGlobalAnsi("SCE_AJM_ERROR_OUT_OF_RESOURCES"),
+            [OrbisAjmErrorCodecAlreadyRegistered] =
+                Marshal.StringToHGlobalAnsi("SCE_AJM_ERROR_CODEC_ALREADY_REGISTERED"),
+            [OrbisAjmErrorCodecNotRegistered] =
+                Marshal.StringToHGlobalAnsi("SCE_AJM_ERROR_CODEC_NOT_REGISTERED"),
+            [OrbisAjmErrorWrongRevisionFlag] =
+                Marshal.StringToHGlobalAnsi("SCE_AJM_ERROR_WRONG_REVISION_FLAG"),
+        };
 }

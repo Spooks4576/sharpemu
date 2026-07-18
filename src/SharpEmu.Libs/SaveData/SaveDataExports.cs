@@ -19,6 +19,8 @@ public static class SaveDataExports
     private const int SaveDataTitleIdSize = 10;
     private const int SaveDataDirNameSize = 32;
     private const int SaveDataParamSize = 0x530;
+    private const int SaveDataMountPointSize = 16;
+    private const ulong SaveDataIconMaxSize = 16UL * 1024 * 1024;
     private const int SaveDataSearchInfoSize = 0x30;
     private const ulong ResultHitNumOffset = 0x00;
     private const ulong ResultDirNamesOffset = 0x08;
@@ -204,8 +206,14 @@ public static class SaveDataExports
             var create = (mountMode & MountModeCreate) != 0;
             var createIfMissing = (mountMode & MountModeCreate2) != 0;
 
+            TraceSaveData(
+                $"mount3_request user={userId} title={titleId} dir={dirName} blocks={blocks} " +
+                $"system_blocks={systemBlocks} mount_mode=0x{mountMode:X} resource={resource} mode={mode} " +
+                $"exists={existed} create={create} create2={createIfMissing} root='{savePath}'");
+
             if (!existed && !create && !createIfMissing)
             {
+                TraceSaveData("mount3_result not_found");
                 return SetReturn(ctx, OrbisSaveDataErrorNotFound);
             }
 
@@ -259,39 +267,15 @@ public static class SaveDataExports
         LibraryName = "libSceSaveData")]
     public static int SaveDataCreateTransactionResource(CpuContext ctx)
     {
-        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
-        var reserved = ctx[CpuRegister.Rsi];
+        var size = unchecked((uint)ctx[CpuRegister.Rdi]);
+        var id = Interlocked.Increment(ref _nextTransactionResource);
 
-        var id = (uint)Interlocked.Increment(ref _nextTransactionResource);
-
-        // The resource-out pointer's argument slot varies by SDK revision: some
-        // callers pass it in rdx, others in rcx (a 4-arg form where rdx holds a
-        // count/flag). Void Terrarium passes rdx=0x1 (not a pointer) and the
-        // real out-pointer in rcx. Probe the plausible candidates and write the
-        // handle to the first writable one instead of faulting on a bad rdx.
-        // This is a stub-level create (matches shadPS4's return-OK semantics);
-        // never return MEMORY_FAULT for it, or the guest treats savedata init as
-        // failed and never advances.
-        var resourceAddress = 0UL;
-        foreach (var candidate in new[]
-                 {
-                     ctx[CpuRegister.Rdx],
-                     ctx[CpuRegister.Rcx],
-                     ctx[CpuRegister.R8],
-                     ctx[CpuRegister.R9],
-                 })
-        {
-            if (candidate != 0 && TryWriteUInt32(ctx, candidate, id))
-            {
-                resourceAddress = candidate;
-                break;
-            }
-        }
-
-        TraceSaveData(
-            $"create_transaction_resource user={userId} reserved=0x{reserved:X} resource_addr=0x{resourceAddress:X} id={id}");
-
-        return SetReturn(ctx, 0);
+        // Gen5 returns the transaction-resource ID directly in RAX. There is
+        // no output pointer: treating unrelated argument registers as pointer
+        // candidates can overwrite arbitrary guest memory (including executable
+        // module text) before the caller observes a successful return.
+        TraceSaveData($"create_transaction_resource size={size} id={id}");
+        return SetReturn(ctx, id);
     }
 
     [SysAbiExport(
@@ -325,6 +309,97 @@ public static class SaveDataExports
         return SetReturn(ctx, 0);
     }
 
+    [SysAbiExport(
+        Nid = "c88Yy54Mx0w",
+        ExportName = "sceSaveDataSaveIcon",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataSaveIcon(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        var iconAddress = ctx[CpuRegister.Rsi];
+        if (!TryResolveMountedSavePath(ctx, mountPointAddress, out var savePath) ||
+            iconAddress == 0 ||
+            !ctx.TryReadUInt64(iconAddress, out var bufferAddress) ||
+            !ctx.TryReadUInt64(iconAddress + 0x08, out var bufferSize) ||
+            !ctx.TryReadUInt64(iconAddress + 0x10, out var dataSize) ||
+            bufferAddress == 0 ||
+            dataSize == 0 ||
+            dataSize > bufferSize ||
+            dataSize > SaveDataIconMaxSize)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        var icon = new byte[checked((int)dataSize)];
+        if (!ctx.Memory.TryRead(bufferAddress, icon))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        try
+        {
+            var systemPath = Path.Combine(savePath, "sce_sys");
+            Directory.CreateDirectory(systemPath);
+            File.WriteAllBytes(Path.Combine(systemPath, "icon0.png"), icon);
+            TraceSaveData($"save_icon mount='{savePath}' bytes={dataSize}");
+            return ctx.SetReturn(0);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorInternal);
+        }
+    }
+
+    [SysAbiExport(
+        Nid = "85zul--eGXs",
+        ExportName = "sceSaveDataSetParam",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataSetParam(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        var paramType = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var bufferAddress = ctx[CpuRegister.Rdx];
+        var bufferSize = ctx[CpuRegister.Rcx];
+        if (!TryResolveMountedSavePath(ctx, mountPointAddress, out var savePath) ||
+            bufferAddress == 0 ||
+            !TryGetParamField(paramType, out var fieldOffset, out var fieldSize) ||
+            bufferSize < (ulong)fieldSize)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        var field = new byte[fieldSize];
+        if (!ctx.Memory.TryRead(bufferAddress, field))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        try
+        {
+            var systemPath = Path.Combine(savePath, "sce_sys");
+            var metadataPath = Path.Combine(systemPath, "sharpemu-param.bin");
+            var metadata = new byte[SaveDataParamSize];
+            if (File.Exists(metadataPath))
+            {
+                using var existing = new FileStream(metadataPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                _ = existing.Read(metadata);
+            }
+
+            field.CopyTo(metadata, fieldOffset);
+            Directory.CreateDirectory(systemPath);
+            File.WriteAllBytes(metadataPath, metadata);
+            TraceSaveData(
+                $"set_param mount='{savePath}' type={paramType} size={fieldSize}");
+            return ctx.SetReturn(0);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorInternal);
+        }
+    }
+
     private static bool TryReadSearchCond(CpuContext ctx, ulong address, out SearchCond cond)
     {
         cond = default;
@@ -349,6 +424,46 @@ public static class SaveDataExports
 
         cond = new SearchCond(userId, titleIdAddress, pattern, sortKey, sortOrder);
         return true;
+    }
+
+    private static bool TryResolveMountedSavePath(
+        CpuContext ctx,
+        ulong mountPointAddress,
+        out string savePath)
+    {
+        savePath = string.Empty;
+        if (mountPointAddress == 0 ||
+            !TryReadFixedAscii(ctx, mountPointAddress, SaveDataMountPointSize, out var mountPoint) ||
+            !mountPoint.StartsWith("/savedata", StringComparison.OrdinalIgnoreCase) ||
+            mountPoint.Length == "/savedata".Length ||
+            !mountPoint["/savedata".Length..].All(char.IsAsciiDigit))
+        {
+            return false;
+        }
+
+        var resolved = KernelMemoryCompatExports.ResolveGuestPath(mountPoint);
+        if (!Path.IsPathFullyQualified(resolved) || !Directory.Exists(resolved))
+        {
+            return false;
+        }
+
+        savePath = Path.GetFullPath(resolved);
+        return true;
+    }
+
+    private static bool TryGetParamField(uint paramType, out int offset, out int size)
+    {
+        (offset, size) = paramType switch
+        {
+            0 => (0x000, SaveDataParamSize),
+            1 => (0x000, 128),
+            2 => (0x080, 128),
+            3 => (0x100, 1024),
+            4 => (0x500, sizeof(uint)),
+            5 => (0x508, sizeof(long)),
+            _ => (0, 0),
+        };
+        return size != 0;
     }
 
     private static bool TryReadSearchResult(CpuContext ctx, ulong address, out SearchResult result)

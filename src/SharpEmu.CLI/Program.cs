@@ -237,6 +237,16 @@ internal static partial class Program
             hostSurface?.WindowHandle ?? 0,
             hostSurface?.DisplayHandle ?? 0);
 
+        if (TryGetCubeTestDuration(emulatorArgs, out var cubeTestDuration))
+        {
+            return RunCubeTest(cubeTestDuration, hostSurface);
+        }
+
+        if (TryGetVideoTestPath(emulatorArgs, out var videoTestPath))
+        {
+            return RunVideoTest(videoTestPath, hostSurface);
+        }
+
         if (!TryParseArguments(emulatorArgs, out var ebootPath, out var runtimeOptions, out var logLevel, out var logFilePath))
         {
             PrintUsage();
@@ -1031,6 +1041,8 @@ internal static partial class Program
     private static void PrintUsage()
     {
         Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] [--log-file[=<path>]] [--debug-server[=host:port]] <path-to-eboot.bin>");
+        Log.Info("Video diagnostic: SharpEmu.CLI --video-test [path-to-video.mp4]");
+        Log.Info("Vulkan cube diagnostic: SharpEmu.CLI --vulkan-cube-test[=<seconds>]");
         Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=debug --log-file ""E:\Games\...\eboot.bin""");
         Log.Info("Debug server: --debug-server starts a live debug listener (default 127.0.0.1:5714); connect with SharpEmu.DebugClient.");
     }

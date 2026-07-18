@@ -10,7 +10,7 @@ namespace SharpEmu.Libs.Tests.Pthread;
 public sealed class PthreadMutexSemanticsTests
 {
     [Fact]
-    public void AdaptiveMutex_SelfLockUsesCompatibilityRecursion()
+    public void AdaptiveMutex_SelfLockSucceedsWithoutLeakingHleRecursion()
     {
         const ulong memoryBase = 0x1_0000_0000;
         const ulong mutexAddress = memoryBase + 0x100;
@@ -22,7 +22,9 @@ public sealed class PthreadMutexSemanticsTests
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
-        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+        Assert.Equal(
+            unchecked((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT),
+            KernelPthreadCompatExports.PthreadMutexUnlock(context));
     }
 
     private sealed class AllocatingCpuMemory : ICpuMemory, IGuestMemoryAllocator

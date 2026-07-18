@@ -52,6 +52,17 @@ public sealed class Gen5SpirvAtomicTranslationTests
     }
 
     [Fact]
+    public void DataShareWriteAddtid_EmitsLaneIndexedStore()
+    {
+        var opcodes = CompileCompute(
+            [0xDAC00300, 0x00000700],
+            new Dictionary<uint, uint>());
+
+        Assert.Contains((ushort)SpirvOp.Store, opcodes);
+        Assert.Contains((ushort)SpirvOp.ShiftLeftLogical, opcodes);
+    }
+
+    [Fact]
     public void ImageAtomicAdd_EmitsTexelPointerAndAtomicAdd()
     {
         // IMAGE_ATOMIC_ADD v2, v[0:1], s[4:11] dmask:0x1 dim:2D glc against an R32ui T#.

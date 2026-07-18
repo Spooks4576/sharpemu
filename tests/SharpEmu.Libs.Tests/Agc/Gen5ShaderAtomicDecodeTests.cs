@@ -103,6 +103,21 @@ public sealed class Gen5ShaderAtomicDecodeTests
         Assert.Equal(new[] { Gen5Operand.Vector(3) }, instruction.Destinations);
     }
 
+    [Fact]
+    public void DsWriteAddtidB32_UsesDataAndSixteenBitOffsetWithoutAddress()
+    {
+        // DS_WRITE_ADDTID_B32 v7 offset:0x300. The address is implicit:
+        // offset + 4 * thread-id, so the encoded ADDR field is not an operand.
+        var instruction = DecodeSingle(0xDAC00300, 0x00000700);
+
+        Assert.Equal("DsWriteAddtidB32", instruction.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(7) }, instruction.Sources);
+        Assert.Empty(instruction.Destinations);
+        var control = Assert.IsType<Gen5DataShareControl>(instruction.Control);
+        Assert.Equal(0u, control.Offset0);
+        Assert.Equal(3u, control.Offset1);
+    }
+
     private static Gen5ShaderInstruction DecodeSingle(params uint[] words)
     {
         var memory = new FakeCpuMemory(ShaderAddress, 0x1000);

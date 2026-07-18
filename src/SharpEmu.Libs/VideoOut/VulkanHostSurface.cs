@@ -267,4 +267,12 @@ public static class VulkanVideoHost
     public static void RequestClose() => VulkanVideoPresenter.RequestClose();
 
     public static bool IsEmbedded => VulkanVideoPresenter.UsesHostSurface;
+
+    /// <summary>
+    /// Submits a tightly packed BGRA8 host frame through the normal Vulkan
+    /// presentation path. This is intended for host-side video diagnostics;
+    /// guest rendering should continue to use VideoOut and AGC submissions.
+    /// </summary>
+    public static void SubmitBgraFrame(byte[] pixels, uint width, uint height) =>
+        VulkanVideoPresenter.Submit(pixels, width, height);
 }

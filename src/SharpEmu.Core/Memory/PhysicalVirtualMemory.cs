@@ -367,8 +367,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var requestedCursor = AlignUp(desiredAddress, effectiveAlignment);
         var cursor = GetAllocationSearchCursor(desiredAddress, requestedCursor, effectiveAlignment, executable);
 
-        // macOS needs alignment over-allocation; Linux uses exact-address search.
-        if (OperatingSystem.IsMacOS())
+        // macOS needs alignment over-allocation. Large sparse reservations on
+        // Windows need the same strategy: if the preferred address is occupied,
+        // probing every alignment step with VirtualAlloc is catastrophically
+        // slow for UE/libc's 512 GiB heap arena request.
+        if (OperatingSystem.IsMacOS() ||
+            (OperatingSystem.IsWindows() && alignedSize >= LargeDataReserveThreshold))
         {
             var reserveSize = effectiveAlignment > PageSize
                 ? alignedSize + effectiveAlignment

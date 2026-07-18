@@ -76,6 +76,7 @@ public static partial class AgcExports
     private const uint SpiShaderPgmHiEs = 0xC9;
     private const uint SpiShaderPgmLoLs = 0x148;
     private const uint SpiShaderPgmHiLs = 0x149;
+    private const uint SpiShaderPgmChecksumGs = 0x80;
     private const uint SpiShaderPgmLoGs = 0x8A;
     private const uint SpiShaderPgmHiGs = 0x8B;
     private const uint SpiPsInputEna = 0x1B3;
@@ -91,6 +92,7 @@ public static partial class AgcExports
     private const uint ComputeNumThreadZ = 0x209;
     private const uint SpiPsInputCntl0 = 0x191;
     private const uint VgtPrimitiveType = 0x242;
+    private const uint GeIndexOffset = 0x24A;
     private const uint PaScScreenScissorTl = 0x0C;
     private const uint PaScScreenScissorBr = 0x0D;
     private const uint CbTargetMask = 0x8E;
@@ -173,6 +175,8 @@ public static partial class AgcExports
     private const ulong ShaderNumOutputSemanticsOffset = 0x56;
     private const ulong ShaderTypeOffset = 0x5A;
     private const ulong ShaderNumShRegistersOffset = 0x5C;
+    private const int ShaderHeaderSize = 0x60;
+    private const int AgcErrorInvalidShaderHalves = unchecked((int)0x8A6C0008);
     private const ulong CommandBufferCursorUpOffset = 0x10;
     private const ulong CommandBufferCursorDownOffset = 0x18;
     private const ulong CommandBufferCallbackOffset = 0x20;
@@ -266,6 +270,11 @@ public static partial class AgcExports
     private static long _labelProducerSequence;
     private static readonly object _labelProducerGate = new();
     private static readonly List<LabelProducerTrace> _labelProducers = [];
+
+    private static readonly bool _completionDataIsSubmissionId = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_AGC_COMPLETION_DATA"),
+        "submission",
+        StringComparison.OrdinalIgnoreCase);
     private static readonly HashSet<(object Memory, ulong Address, ulong SubmissionId)>
         _tracedProducerlessWaits = new();
     private static long _shaderTranslationMissTraceCount;
@@ -531,6 +540,7 @@ public static partial class AgcExports
         public uint IndexSize { get; set; }
         public uint InstanceCount { get; set; } = 1;
         public uint DrawIndexOffset { get; set; }
+        public int DrawBaseVertexOffset { get; set; }
         public string QueueName { get; set; } = "graphics";
         public ulong ActiveSubmissionId { get; set; }
         public Queue<PendingSubmission> PendingSubmissions { get; } = new();
@@ -542,6 +552,7 @@ public static partial class AgcExports
         public uint FrameDrawCount { get; set; }
         public uint FrameDispatchCount { get; set; }
         public ulong FlipCount { get; set; }
+        public Queue<string> RecentDispatchSummaries { get; } = new();
     }
 
     private sealed class SubmittedGpuState
@@ -705,6 +716,137 @@ public static partial class AgcExports
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    // The public name is not present in the current symbol catalog; these NIDs
+    // and ABI layouts are used by shipped Gen5 Unreal titles.
+    #pragma warning disable SHEM004, SHEM006
+    [SysAbiExport(
+        Nid = "dolOmWH+huQ",
+        ExportName = "sceAgcUnknownGetFusedShaderSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GetFusedShaderSize(CpuContext ctx)
+    {
+        var resultAddress = ctx[CpuRegister.Rdi];
+        var frontAddress = ctx[CpuRegister.Rsi];
+        var backAddress = ctx[CpuRegister.Rdx];
+        if (resultAddress == 0 ||
+            !TryReadCompatibleShaderHalfTypes(ctx, frontAddress, backAddress, out _, out _) ||
+            !TryReadByte(ctx, backAddress + ShaderNumShRegistersOffset, out var registerCount))
+        {
+            return SetRawReturn(ctx, AgcErrorInvalidShaderHalves);
+        }
+
+        Span<byte> sizeAlign = stackalloc byte[2 * sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(sizeAlign, (ulong)registerCount * 8UL);
+        BinaryPrimitives.WriteUInt64LittleEndian(sizeAlign[sizeof(ulong)..], 4);
+        if (!ctx.Memory.TryWrite(resultAddress, sizeAlign))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceAgc($"agc.fused_shader_size front=0x{frontAddress:X16} back=0x{backAddress:X16} registers={registerCount}");
+        return SetRawReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
+        Nid = "fd5Bp5tGTgo",
+        ExportName = "sceAgcUnknownFuseShaderHalves",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int FuseShaderHalves(CpuContext ctx)
+    {
+        var resultAddress = ctx[CpuRegister.Rdi];
+        var frontAddress = ctx[CpuRegister.Rsi];
+        var backAddress = ctx[CpuRegister.Rdx];
+        var scratchAddress = ctx[CpuRegister.Rcx];
+        if (resultAddress == 0 ||
+            !TryReadCompatibleShaderHalfTypes(ctx, frontAddress, backAddress, out var frontType, out _))
+        {
+            return SetRawReturn(ctx, AgcErrorInvalidShaderHalves);
+        }
+
+        if (!TryValidateFusedShaderStages(ctx, frontAddress, backAddress, frontType, out var stagesMatch))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (!stagesMatch)
+        {
+            return SetRawReturn(ctx, AgcErrorInvalidShaderHalves);
+        }
+
+        Span<byte> header = stackalloc byte[ShaderHeaderSize];
+        if (!ctx.Memory.TryRead(backAddress, header))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        // GS-front/GS-back become GS (2); HS-front/HS-back become HS (3).
+        header[(int)ShaderTypeOffset] = frontType == 4 ? (byte)2 : (byte)3;
+        BinaryPrimitives.WriteUInt64LittleEndian(header[(int)ShaderUserDataOffset..], 0);
+        var registerCount = header[(int)ShaderNumShRegistersOffset];
+        var registersAddress = BinaryPrimitives.ReadUInt64LittleEndian(
+            header[(int)ShaderShRegistersOffset..]);
+        if (scratchAddress != 0 && registersAddress != 0 && registerCount != 0)
+        {
+            var registerBytes = new byte[registerCount * 8];
+            if (!ctx.Memory.TryRead(registersAddress, registerBytes) ||
+                !ctx.Memory.TryWrite(scratchAddress, registerBytes))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                header[(int)ShaderShRegistersOffset..],
+                scratchAddress);
+            registersAddress = scratchAddress;
+        }
+
+        if (!TryReadUInt64(ctx, frontAddress + ShaderCodeOffset, out var frontCodeAddress) ||
+            !TryReadUInt64(ctx, frontAddress + ShaderShRegistersOffset, out var frontRegistersAddress) ||
+            !TryReadByte(ctx, frontAddress + ShaderNumShRegistersOffset, out var frontRegisterCount))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (registersAddress != 0 && registerCount != 0)
+        {
+            if (frontType == 4 &&
+                !TryCopyShaderRegisterOccurrences(
+                    ctx,
+                    frontRegistersAddress,
+                    frontRegisterCount,
+                    registersAddress,
+                    registerCount,
+                    SpiShaderPgmChecksumGs,
+                    2))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            var programLo = frontType == 4 ? SpiShaderPgmLoEs : SpiShaderPgmLoLs;
+            if (!TryPatchShaderRegisterAddress(
+                    ctx,
+                    registersAddress,
+                    registerCount,
+                    programLo,
+                    programLo + 1,
+                    frontCodeAddress))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        if (!ctx.Memory.TryWrite(resultAddress, header))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceAgc($"agc.fuse_shader front=0x{frontAddress:X16} back=0x{backAddress:X16} result=0x{resultAddress:X16} scratch=0x{scratchAddress:X16} registers={registerCount}");
+        return SetRawReturn(ctx, 0);
+    }
+    #pragma warning restore SHEM004, SHEM006
 
     [SysAbiExport(
         Nid = "vcmNN+AAXnY",
@@ -2928,10 +3070,18 @@ public static partial class AgcExports
         state.CompletionEventNotifiedSubmissionId = submissionId;
         void TriggerCompletionEvents()
         {
+            // The GPU EOP event delivered to the AGC interrupt thread carries a
+            // completion counter in its kevent data field; the guest handler
+            // compares it against per-record expected values to decide which
+            // submissions (and their RHI fences) retired. A constant payload
+            // makes every completion look identical, so a value-comparing
+            // handler can never advance past its first outstanding fence.
+            // Opt-in (SHARPEMU_AGC_COMPLETION_DATA=submission) pending
+            // verification across titles.
             var triggered = KernelEventQueueCompatExports.TriggerRegisteredEvents(
                 ident: 0,
                 KernelEventQueueCompatExports.KernelEventFilterGraphics,
-                data: 0);
+                data: _completionDataIsSubmissionId ? submissionId : 0);
             if (_compatibilitySubmitCompletionEvent)
             {
                 triggered += KernelEventQueueCompatExports.TriggerRegisteredEventsDistinct(
@@ -3772,7 +3922,10 @@ public static partial class AgcExports
         }
     }
 
-    private static void TraceWaitProducerState(
+    // Returns true only for the first observation of a producerless
+    // (non-stale) wait on a given label so callers can attach one-shot
+    // deep diagnostics without re-dumping on every stale re-check.
+    private static bool TraceWaitProducerState(
         object memory,
         in GpuWaitRegistry.WaitingDcb waiter,
         ulong commandAddress,
@@ -3809,7 +3962,7 @@ public static partial class AgcExports
                 !_tracedProducerlessWaits.Add(
                     (memory, waiter.WaitAddress, waiter.SubmissionId)))
             {
-                return;
+                return false;
             }
         }
 
@@ -3818,7 +3971,7 @@ public static partial class AgcExports
         // detailed condition strings when AGC tracing is disabled.
         if (producer is not null && !_traceAgc)
         {
-            return;
+            return false;
         }
 
         var prefix = stale ? "agc.wait_stale" : "agc.wait_suspended";
@@ -3838,7 +3991,7 @@ public static partial class AgcExports
                 $"command=0x{commandAddress:X16} packet=0x{packetAddress:X16} " +
                 condition + " " +
                 "producer=none-observed; remaining-suspended");
-            return;
+            return !stale;
         }
 
         TraceAgc(
@@ -3851,6 +4004,170 @@ public static partial class AgcExports
             $"producer_submission={producer.SubmissionId} " +
             $"producer_packet=0x{producer.PacketAddress:X16} " +
             $"action='{producer.DebugName}'");
+        return false;
+    }
+
+    private static void RecordRecentDispatch(SubmittedDcbState state, string summary)
+    {
+        var dispatches = state.RecentDispatchSummaries;
+        while (dispatches.Count >= 8)
+        {
+            dispatches.Dequeue();
+        }
+
+        dispatches.Enqueue(summary);
+    }
+
+    /// <summary>
+    /// One-shot deep diagnostics for a wait whose label has no observed
+    /// producer. Emits the raw wait packet, the PM4 packets around it, any
+    /// tracked producers writing near (but not at) the label, and the recent
+    /// compute dispatch outcomes on the waiting queue. Never pauses or
+    /// mutates guest state; log-only.
+    /// </summary>
+    private static void DumpProducerlessWaitDiagnostics(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        in GpuWaitRegistry.WaitingDcb waiter,
+        ulong commandAddress,
+        ulong packetAddress,
+        uint packetOffset,
+        uint packetLength,
+        uint dwordCount)
+    {
+        var label = waiter.WaitAddress;
+
+        var rawCount = Math.Min(packetLength, 16u);
+        var rawDwords = new List<string>((int)rawCount);
+        for (var index = 0u; index < rawCount; index++)
+        {
+            rawDwords.Add(
+                TryReadUInt32(ctx, packetAddress + (index * sizeof(uint)), out var dword)
+                    ? $"{dword:X8}"
+                    : "????????");
+        }
+
+        var preceding = new Queue<string>();
+        var following = new List<string>();
+        var walkOffset = 0u;
+        while (walkOffset < dwordCount)
+        {
+            var address = commandAddress + ((ulong)walkOffset * sizeof(uint));
+            if (!TryReadUInt32(ctx, address, out var header))
+            {
+                break;
+            }
+
+            var packetType = header >> 30;
+            uint length;
+            string summary;
+            if (packetType == 2)
+            {
+                length = 1;
+                summary = $"dw={walkOffset} type2";
+            }
+            else if (packetType != 3)
+            {
+                break;
+            }
+            else
+            {
+                length = Pm4Length(header);
+                if (length == 0 || walkOffset + length > dwordCount)
+                {
+                    break;
+                }
+
+                var op = (header >> 8) & 0xFFu;
+                var register = (header >> 2) & 0x3Fu;
+                var bodyCount = Math.Min(length - 1, 4u);
+                var body = new List<string>((int)bodyCount);
+                for (var index = 1u; index <= bodyCount; index++)
+                {
+                    body.Add(
+                        TryReadUInt32(
+                            ctx,
+                            address + (index * sizeof(uint)),
+                            out var bodyDword)
+                            ? $"{bodyDword:X8}"
+                            : "????????");
+                }
+
+                summary =
+                    $"dw={walkOffset} op=0x{op:X2} reg=0x{register:X2} len={length} " +
+                    $"body=[{string.Join(' ', body)}]";
+            }
+
+            if (walkOffset < packetOffset)
+            {
+                if (preceding.Count >= 8)
+                {
+                    preceding.Dequeue();
+                }
+
+                preceding.Enqueue(summary);
+            }
+            else if (walkOffset > packetOffset)
+            {
+                following.Add(summary);
+                if (following.Count >= 8)
+                {
+                    break;
+                }
+            }
+
+            walkOffset += length;
+        }
+
+        var nearProducers = new List<string>();
+        lock (_labelProducerGate)
+        {
+            for (var index = _labelProducers.Count - 1;
+                 index >= 0 && nearProducers.Count < 4;
+                 index--)
+            {
+                var candidate = _labelProducers[index];
+                if (!ReferenceEquals(candidate.Memory, ctx.Memory))
+                {
+                    continue;
+                }
+
+                var distance = candidate.Address >= label
+                    ? candidate.Address - label
+                    : label - candidate.Address;
+                if (distance > 0x1000)
+                {
+                    continue;
+                }
+
+                nearProducers.Add(
+                    $"delta={(candidate.Address >= label ? "+" : "-")}0x{distance:X} " +
+                    $"addr=0x{candidate.Address:X16}+0x{candidate.Length:X} " +
+                    $"queue={candidate.QueueName} submission={candidate.SubmissionId} " +
+                    $"state={(candidate.Completed ? "completed" : "queued")} " +
+                    $"action='{candidate.DebugName}'");
+            }
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.wait_diag label=0x{label:X16} " +
+            $"queue={waiter.QueueName} submission={waiter.SubmissionId} " +
+            $"packet_offset_dw={packetOffset} " +
+            $"packet_dwords=[{string.Join(' ', rawDwords)}]");
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.wait_diag.before label=0x{label:X16} " +
+            $"packets=[{string.Join(" | ", preceding)}]");
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.wait_diag.after label=0x{label:X16} " +
+            $"packets=[{string.Join(" | ", following)}]");
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.wait_diag.near_producers label=0x{label:X16} " +
+            $"count={nearProducers.Count} " +
+            $"entries=[{string.Join(" | ", nearProducers)}]");
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.wait_diag.recent_dispatches label=0x{label:X16} " +
+            $"queue={state.QueueName} " +
+            $"entries=[{string.Join(" | ", state.RecentDispatchSummaries)}]");
     }
 
     private static void ApplySubmittedAcquireMem(
@@ -4001,6 +4318,7 @@ public static partial class AgcExports
         state.IndexSize = 0;
         state.InstanceCount = 1;
         state.DrawIndexOffset = 0;
+        state.DrawBaseVertexOffset = 0;
     }
 
     private static bool RangesOverlap(
@@ -4455,6 +4773,7 @@ public static partial class AgcExports
             IndexSize = 1,
             InstanceCount = 4,
             DrawIndexOffset = 2,
+            DrawBaseVertexOffset = 3,
             IndirectArgsAddress = 0x2000,
             SawIndexedDraw = true,
             GuestDrawKind = GuestDrawKind.FullscreenBarycentric,
@@ -4472,6 +4791,7 @@ public static partial class AgcExports
         System.Diagnostics.Debug.Assert(queue.IndexSize == 0);
         System.Diagnostics.Debug.Assert(queue.InstanceCount == 1);
         System.Diagnostics.Debug.Assert(queue.DrawIndexOffset == 0);
+        System.Diagnostics.Debug.Assert(queue.DrawBaseVertexOffset == 0);
         System.Diagnostics.Debug.Assert(queue.IndirectArgsAddress == 0);
         System.Diagnostics.Debug.Assert(!queue.SawIndexedDraw);
         System.Diagnostics.Debug.Assert(queue.GuestDrawKind == GuestDrawKind.None);
@@ -4687,6 +5007,23 @@ public static partial class AgcExports
             return false; // already satisfied — keep parsing
         }
 
+        // Command parsing runs ahead of the host Vulkan queue. A release/DMA
+        // packet earlier in this submission may still be queued while this
+        // later wait observes the old guest value. Hardware executes those
+        // packets in queue order; suspending here deadlocks the submission.
+        if (HasEarlierSameQueueProducer(
+                ctx.Memory,
+                waiter,
+                packetAddress,
+                out var producerSequence))
+        {
+            TraceAgc(
+                $"agc.dcb.wait_ordered addr=0x{waitAddress:X16} " +
+                $"producer_seq={producerSequence} queue={state.QueueName} " +
+                $"submission={state.ActiveSubmissionId} packet=0x{packetAddress:X16}");
+            return false;
+        }
+
         if (!_gpuWaitSuspendEnabled)
         {
             if (hasCurrent)
@@ -4707,13 +5044,25 @@ public static partial class AgcExports
             ctx.Memory,
             static _ => new SubmittedGpuState());
         EnsureGpuWaitMonitor(ctx, gpuState);
-        TraceWaitProducerState(
+        var firstProducerlessWait = TraceWaitProducerState(
             ctx.Memory,
             waiter,
             commandAddress,
             packetAddress,
             stale: false,
             currentValue);
+        if (firstProducerlessWait)
+        {
+            DumpProducerlessWaitDiagnostics(
+                ctx,
+                state,
+                waiter,
+                commandAddress,
+                packetAddress,
+                offset,
+                length,
+                dwordCount);
+        }
         if (tracePacket)
         {
             TraceAgc(
@@ -4722,6 +5071,39 @@ public static partial class AgcExports
         }
 
         return true;
+    }
+
+    private static bool HasEarlierSameQueueProducer(
+        object memory,
+        in GpuWaitRegistry.WaitingDcb waiter,
+        ulong waitPacketAddress,
+        out long producerSequence)
+    {
+        lock (_labelProducerGate)
+        {
+            for (var index = _labelProducers.Count - 1; index >= 0; index--)
+            {
+                var producer = _labelProducers[index];
+                if (!ReferenceEquals(producer.Memory, memory) ||
+                    producer.SubmissionId != waiter.SubmissionId ||
+                    !string.Equals(producer.QueueName, waiter.QueueName, StringComparison.Ordinal) ||
+                    producer.PacketAddress >= waitPacketAddress ||
+                    !RangesOverlap(
+                        producer.Address,
+                        producer.Length,
+                        waiter.WaitAddress,
+                        waiter.Is64Bit ? (ulong)sizeof(ulong) : sizeof(uint)))
+                {
+                    continue;
+                }
+
+                producerSequence = producer.Sequence;
+                return true;
+            }
+        }
+
+        producerSequence = 0;
+        return false;
     }
 
     /// <summary>
@@ -5195,7 +5577,19 @@ public static partial class AgcExports
             case ItDrawIndexAuto when packetLength >= 3:
                 return TryReadUInt32(ctx, packetAddress + 4, out drawCount);
             case ItDrawIndex2 when packetLength >= 6:
+                // DRAW_INDEX_2 carries the authoritative index address in the
+                // packet. INDEX_BASE is persistent state used by the offset
+                // and indirect forms; it can legitimately still describe an
+                // older draw. Kyty follows the inline address here as does the
+                // hardware packet definition.
+                if (!TryReadUInt64(ctx, packetAddress + 8, out var inlineIndexAddress))
+                {
+                    return false;
+                }
+
+                state.IndexBufferAddress = inlineIndexAddress;
                 state.DrawIndexOffset = 0;
+                state.DrawBaseVertexOffset = 0;
                 return TryReadUInt32(ctx, packetAddress + 16, out drawCount);
             case ItDrawIndexOffset2 when packetLength >= 5:
                 if (!TryReadUInt32(ctx, packetAddress + 8, out var indexOffset))
@@ -5204,6 +5598,7 @@ public static partial class AgcExports
                 }
 
                 state.DrawIndexOffset = indexOffset;
+                state.DrawBaseVertexOffset = 0;
                 return TryReadUInt32(ctx, packetAddress + 12, out drawCount);
             case ItDrawIndexMultiAuto when packetLength >= 4:
                 if (!TryReadUInt32(ctx, packetAddress + 12, out var control))
@@ -5220,10 +5615,31 @@ public static partial class AgcExports
                     return false;
                 }
 
-                return TryReadUInt32(
-                    ctx,
-                    state.IndirectArgsAddress + dataOffset,
-                    out drawCount);
+                var argumentsAddress = state.IndirectArgsAddress + dataOffset;
+                if (!TryReadUInt32(ctx, argumentsAddress, out drawCount))
+                {
+                    return false;
+                }
+
+                if (op == ItDrawIndexIndirect)
+                {
+                    // VkDrawIndexedIndirectCommand layout: count, instances,
+                    // firstIndex, vertexOffset, firstInstance. Preserve both
+                    // offsets instead of replaying every indirect draw from
+                    // the start of INDEX_BASE with a zero base vertex.
+                    if (!TryReadUInt32(ctx, argumentsAddress + 4, out var instanceCount) ||
+                        !TryReadUInt32(ctx, argumentsAddress + 8, out var firstIndex) ||
+                        !TryReadUInt32(ctx, argumentsAddress + 12, out var baseVertex))
+                    {
+                        return false;
+                    }
+
+                    state.InstanceCount = Math.Max(instanceCount, 1);
+                    state.DrawIndexOffset = firstIndex;
+                    state.DrawBaseVertexOffset = unchecked((int)baseVertex);
+                }
+
+                return true;
             default:
                 return false;
         }
@@ -6374,8 +6790,14 @@ public static partial class AgcExports
             return null;
         }
 
-        var is32Bit = state.IndexSize != 0;
-        var bytesPerIndex = is32Bit ? sizeof(uint) : sizeof(ushort);
+        if (state.IndexSize > 2)
+        {
+            return null;
+        }
+
+        var is32Bit = state.IndexSize == 1;
+        var is8Bit = state.IndexSize == 2;
+        var bytesPerIndex = is32Bit ? sizeof(uint) : is8Bit ? sizeof(byte) : sizeof(ushort);
         var byteOffset = checked((ulong)state.DrawIndexOffset * (uint)bytesPerIndex);
         var byteCount = checked((int)(indexCount * (uint)bytesPerIndex));
         var data = VulkanVideoPresenter.GuestDataPool.Rent(byteCount);
@@ -6384,7 +6806,35 @@ public static partial class AgcExports
         if (ctx.Memory.TryRead(address, span) ||
             KernelMemoryCompatExports.TryReadTrackedLibcHeap(address, span))
         {
-            return new GuestIndexBuffer(data, byteCount, is32Bit, Pooled: true);
+            var vertexOffset = GetEffectiveBaseVertexOffset(state);
+            if (!is8Bit)
+            {
+                return new GuestIndexBuffer(
+                    data,
+                    byteCount,
+                    is32Bit,
+                    Pooled: true,
+                    VertexOffset: vertexOffset);
+            }
+
+            // Vulkan's core index types are 16/32-bit. Match Kyty's handling
+            // of the PS5 8-bit type by expanding it to a host uint16 stream.
+            var expandedByteCount = checked((int)indexCount * sizeof(ushort));
+            var expanded = VulkanVideoPresenter.GuestDataPool.Rent(expandedByteCount);
+            for (var index = 0; index < (int)indexCount; index++)
+            {
+                BinaryPrimitives.WriteUInt16LittleEndian(
+                    expanded.AsSpan(index * sizeof(ushort), sizeof(ushort)),
+                    data[index]);
+            }
+
+            VulkanVideoPresenter.GuestDataPool.Return(data);
+            return new GuestIndexBuffer(
+                expanded,
+                expandedByteCount,
+                Is32Bit: false,
+                Pooled: true,
+                VertexOffset: vertexOffset);
         }
 
         VulkanVideoPresenter.GuestDataPool.Return(data);
@@ -6409,10 +6859,17 @@ public static partial class AgcExports
             return false;
         }
 
-        var is32Bit = state.IndexSize != 0;
-        var bytesPerIndex = is32Bit ? sizeof(uint) : sizeof(ushort);
+        if (state.IndexSize > 2)
+        {
+            return false;
+        }
+
+        var is32Bit = state.IndexSize == 1;
+        var is8Bit = state.IndexSize == 2;
+        var bytesPerIndex = is32Bit ? sizeof(uint) : is8Bit ? sizeof(byte) : sizeof(ushort);
         var byteOffset = checked((ulong)state.DrawIndexOffset * (uint)bytesPerIndex);
         var address = state.IndexBufferAddress + byteOffset;
+        var baseVertex = GetEffectiveBaseVertexOffset(state);
         const int chunkBytes = 64 * 1024;
         var scratch = VulkanVideoPresenter.GuestDataPool.Rent(chunkBytes);
         var remaining = drawCount;
@@ -6438,15 +6895,28 @@ public static partial class AgcExports
                     var value = is32Bit
                         ? BinaryPrimitives.ReadUInt32LittleEndian(
                             span.Slice(index * sizeof(uint), sizeof(uint)))
-                        : BinaryPrimitives.ReadUInt16LittleEndian(
-                            span.Slice(index * sizeof(ushort), sizeof(ushort)));
-                    if (value == (is32Bit ? uint.MaxValue : ushort.MaxValue))
+                        : is8Bit
+                            ? span[index]
+                            : BinaryPrimitives.ReadUInt16LittleEndian(
+                                span.Slice(index * sizeof(ushort), sizeof(ushort)));
+                    var restartValue = is32Bit
+                        ? uint.MaxValue
+                        : is8Bit
+                            ? byte.MaxValue
+                            : ushort.MaxValue;
+                    if (value == restartValue)
                     {
                         // Primitive-restart markers do not address vertex data.
                         continue;
                     }
 
-                    maxIndex = Math.Max(maxIndex, value);
+                    var adjustedValue = (long)value + baseVertex;
+                    if (adjustedValue < 0 || adjustedValue > uint.MaxValue)
+                    {
+                        return false;
+                    }
+
+                    maxIndex = Math.Max(maxIndex, (uint)adjustedValue);
                     sawIndex = true;
                 }
 
@@ -6469,10 +6939,17 @@ public static partial class AgcExports
             Console.Error.WriteLine(
                 $"[LOADER][TRACE] agc.vertex_range indexed=1 draw_count={drawCount} " +
                 $"max_index={(sawIndex ? maxIndex : 0)} records={recordCount} " +
-                $"instances={state.InstanceCount} index_size={(is32Bit ? 32 : 16)} " +
-                $"index_addr=0x{state.IndexBufferAddress:X16} offset={state.DrawIndexOffset}");
+                $"instances={state.InstanceCount} index_size={(is32Bit ? 32 : is8Bit ? 8 : 16)} " +
+                $"index_addr=0x{state.IndexBufferAddress:X16} offset={state.DrawIndexOffset} " +
+                $"base_vertex={baseVertex}");
         }
         return true;
+    }
+
+    private static int GetEffectiveBaseVertexOffset(SubmittedDcbState state)
+    {
+        state.UcRegisters.TryGetValue(GeIndexOffset, out var geIndexOffset);
+        return unchecked((int)geIndexOffset + state.DrawBaseVertexOffset);
     }
 
     private static uint GetPixelColorExportMask(uint packedMasks, uint target) =>
@@ -7920,7 +8397,14 @@ public static partial class AgcExports
             return;
         }
 
-        var byteCount = (ulong)target.Width * target.Height * 4;
+        // Render-target storage follows the descriptor's data format.  The
+        // old RGBA8-only assumption under-allocated seeds for 64-bit targets
+        // (notably R16G16B16A16), then Vulkan was asked to copy twice as many
+        // bytes as the staging buffer contained.
+        var byteCount = VulkanVideoPresenter.GetGuestSurfaceByteCount(
+            target.Format,
+            target.Width,
+            target.Height);
         if (byteCount == 0 || byteCount > MaxPresentedTextureBytes)
         {
             return;
@@ -7960,6 +8444,9 @@ public static partial class AgcExports
         var viewport = draw.RenderState.Viewport is { } vp
             ? $"{vp.X:0.#},{vp.Y:0.#},{vp.Width:0.#}x{vp.Height:0.#}"
             : "none";
+        var scissor = draw.RenderState.Scissor is { } sc
+            ? $"{sc.X},{sc.Y},{sc.Width}x{sc.Height}"
+            : "none";
         var textureList = string.Join(
             '|',
             textures.Select(texture =>
@@ -7973,15 +8460,58 @@ public static partial class AgcExports
             var stride = Math.Max(positionBuffer.Stride, 4u);
             var vertexTotal = (int)((positionBuffer.Length - positionBuffer.OffsetBytes) / stride);
             var sampled = new List<string>();
-            foreach (var vertex in new[] { 0, 1, vertexTotal - 1 })
+            var sampledVertices = new List<int>(6);
+            if (draw.IndexBuffer is { } tracedIndices)
             {
-                var baseOffset = (int)(positionBuffer.OffsetBytes + vertex * stride);
-                if (vertex < 0 || baseOffset + 8 > positionBuffer.Length)
+                var indexSize = tracedIndices.Is32Bit ? sizeof(uint) : sizeof(ushort);
+                var indexCount = Math.Min(
+                    (int)Math.Min(draw.VertexCount, int.MaxValue),
+                    tracedIndices.Length / indexSize);
+                for (var index = 0; index < Math.Min(indexCount, 6); index++)
+                {
+                    var indexOffset = index * indexSize;
+                    if (tracedIndices.Is32Bit)
+                    {
+                        var vertex = BinaryPrimitives.ReadUInt32LittleEndian(
+                            tracedIndices.Data.AsSpan(indexOffset, indexSize));
+                        var effectiveVertex = (long)vertex + tracedIndices.VertexOffset;
+                        if (effectiveVertex is >= 0 and <= int.MaxValue)
+                        {
+                            sampledVertices.Add((int)effectiveVertex);
+                        }
+                    }
+                    else
+                    {
+                        var vertex = BinaryPrimitives.ReadUInt16LittleEndian(
+                            tracedIndices.Data.AsSpan(indexOffset, indexSize));
+                        var effectiveVertex = (long)vertex + tracedIndices.VertexOffset;
+                        if (effectiveVertex is >= 0 and <= int.MaxValue)
+                        {
+                            sampledVertices.Add((int)effectiveVertex);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                for (var vertex = 0; vertex < Math.Min(vertexTotal, 6); vertex++)
+                {
+                    sampledVertices.Add(vertex);
+                }
+            }
+
+            foreach (var vertex in sampledVertices)
+            {
+                if (vertex < 0 || vertex >= vertexTotal)
                 {
                     continue;
                 }
 
+                var baseOffset = checked((int)(
+                    (ulong)positionBuffer.OffsetBytes + ((ulong)vertex * stride)));
+
                 sampled.Add(
+                    $"{vertex}:" +
                     $"{BitConverter.ToSingle(positionBuffer.Data, baseOffset):0.##}," +
                     $"{BitConverter.ToSingle(positionBuffer.Data, baseOffset + 4):0.##}");
             }
@@ -7995,7 +8525,8 @@ public static partial class AgcExports
             $"prim=0x{draw.PrimitiveType:X} verts={draw.VertexCount} indexed={draw.IndexBuffer is not null} " +
             $"blend={(blend.Enable ? 1 : 0)}:{blend.ColorSrcFactor}/{blend.ColorDstFactor}/{blend.ColorFunc}" +
             $":a{blend.AlphaSrcFactor}/{blend.AlphaDstFactor}/{blend.AlphaFunc}/s{(blend.SeparateAlphaBlend ? 1 : 0)} " +
-            $"mask=0x{blend.WriteMask:X} viewport={viewport} textures={textureList} pos={positions} " +
+            $"mask=0x{blend.WriteMask:X} viewport={viewport} scissor={scissor} " +
+            $"textures={textureList} pos={positions} " +
             $"ps_s0..3={string.Join(',', draw.PixelUserData.Take(4).Select(value => BitConverter.UInt32BitsToSingle(value).ToString("0.###")))} " +
             $"rawblend=0x{draw.RawBlendControl:X8} info=0x{draw.RawColorInfo:X8}");
     }
@@ -8492,6 +9023,7 @@ public static partial class AgcExports
                 ComputePgmHi,
                 out var shaderAddress))
         {
+            RecordRecentDispatch(state, "cs=unknown outcome=no-shader-address");
             return;
         }
 
@@ -8527,6 +9059,10 @@ public static partial class AgcExports
                 }
             }
 
+            RecordRecentDispatch(
+                state,
+                $"seq={sequence} cs=0x{shaderAddress:X16} " +
+                $"outcome=translate-failed error={error}");
             return;
         }
 
@@ -8709,6 +9245,22 @@ public static partial class AgcExports
         }
 
         const int blitCount = 0;
+
+        var writableGlobalBuffers = string.Join(
+            ',',
+            evaluation.GlobalMemoryBindings
+                .Where(static binding => binding.Writable)
+                .Take(6)
+                .Select(static binding =>
+                    $"0x{binding.BaseAddress:X16}+0x{binding.DataLength:X}"));
+        RecordRecentDispatch(
+            state,
+            $"seq={sequence} cs=0x{shaderAddress:X16} gpu={gpuDispatch} " +
+            $"storage={hasStorageBinding} global_writes={writesGlobalMemory}" +
+            (computeError.Length == 0 ? string.Empty : $" error={computeError}") +
+            (writableGlobalBuffers.Length == 0
+                ? string.Empty
+                : $" writable=[{writableGlobalBuffers}]"));
 
         lock (_submitTraceGate)
         {
@@ -10504,6 +11056,159 @@ public static partial class AgcExports
         return (int)result;
     }
 
+    private static int SetRawReturn(CpuContext ctx, int result)
+    {
+        ctx[CpuRegister.Rax] = unchecked((ulong)result);
+        return result;
+    }
+
+    private static bool TryReadCompatibleShaderHalfTypes(
+        CpuContext ctx,
+        ulong frontAddress,
+        ulong backAddress,
+        out byte frontType,
+        out byte backType)
+    {
+        frontType = 0;
+        backType = 0;
+        return frontAddress != 0 &&
+            backAddress != 0 &&
+            TryReadByte(ctx, frontAddress + ShaderTypeOffset, out frontType) &&
+            TryReadByte(ctx, backAddress + ShaderTypeOffset, out backType) &&
+            ((frontType == 4 && backType == 6) ||
+             (frontType == 5 && backType == 7));
+    }
+
+    private static bool TryValidateFusedShaderStages(
+        CpuContext ctx,
+        ulong frontAddress,
+        ulong backAddress,
+        byte frontType,
+        out bool stagesMatch)
+    {
+        stagesMatch = false;
+        if (!TryReadUInt64(ctx, frontAddress + ShaderSpecialsOffset, out var frontSpecialsAddress) ||
+            !TryReadUInt64(ctx, backAddress + ShaderSpecialsOffset, out var backSpecialsAddress))
+        {
+            return false;
+        }
+
+        if (frontSpecialsAddress == 0 || backSpecialsAddress == 0)
+        {
+            stagesMatch = true;
+            return true;
+        }
+
+        // Each special entry is a register/value pair. GS and HS halves must
+        // agree on the stage-enable bit which joins their respective halves.
+        if (!TryReadUInt32(
+                ctx,
+                frontSpecialsAddress + ShaderSpecialVgtShaderStagesEnOffset + sizeof(uint),
+                out var frontStages) ||
+            !TryReadUInt32(
+                ctx,
+                backSpecialsAddress + ShaderSpecialVgtShaderStagesEnOffset + sizeof(uint),
+                out var backStages))
+        {
+            return false;
+        }
+
+        var stageMask = frontType == 4 ? 1u << 22 : 1u << 21;
+        stagesMatch = ((frontStages ^ backStages) & stageMask) == 0;
+        return true;
+    }
+
+    private static bool TryPatchShaderRegisterAddress(
+        CpuContext ctx,
+        ulong registersAddress,
+        byte registerCount,
+        uint loRegister,
+        uint hiRegister,
+        ulong codeAddress)
+    {
+        var loValue = (uint)((codeAddress >> 8) & 0xFFFF_FFFFUL);
+        var hiValue = (uint)((codeAddress >> 40) & 0xFFUL);
+        for (var index = 0; index < registerCount; index++)
+        {
+            var entryAddress = registersAddress + ((ulong)index * 8);
+            if (!TryReadUInt32(ctx, entryAddress, out var registerOffset))
+            {
+                return false;
+            }
+
+            if (registerOffset == loRegister &&
+                !TryWriteUInt32(ctx, entryAddress + sizeof(uint), loValue))
+            {
+                return false;
+            }
+
+            if (registerOffset == hiRegister &&
+                !TryWriteUInt32(ctx, entryAddress + sizeof(uint), hiValue))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TryCopyShaderRegisterOccurrences(
+        CpuContext ctx,
+        ulong sourceRegistersAddress,
+        byte sourceRegisterCount,
+        ulong destinationRegistersAddress,
+        byte destinationRegisterCount,
+        uint registerOffset,
+        int occurrenceCount)
+    {
+        if (sourceRegistersAddress == 0 || sourceRegisterCount == 0)
+        {
+            return true;
+        }
+
+        var sourceOccurrence = 0;
+        for (var sourceIndex = 0; sourceIndex < sourceRegisterCount && sourceOccurrence < occurrenceCount; sourceIndex++)
+        {
+            var sourceEntryAddress = sourceRegistersAddress + ((ulong)sourceIndex * 8);
+            if (!TryReadUInt32(ctx, sourceEntryAddress, out var sourceOffset) ||
+                !TryReadUInt32(ctx, sourceEntryAddress + sizeof(uint), out var sourceValue))
+            {
+                return false;
+            }
+
+            if (sourceOffset != registerOffset)
+            {
+                continue;
+            }
+
+            var destinationOccurrence = 0;
+            for (var destinationIndex = 0; destinationIndex < destinationRegisterCount; destinationIndex++)
+            {
+                var destinationEntryAddress = destinationRegistersAddress + ((ulong)destinationIndex * 8);
+                if (!TryReadUInt32(ctx, destinationEntryAddress, out var destinationOffset))
+                {
+                    return false;
+                }
+
+                if (destinationOffset != registerOffset || destinationOccurrence++ != sourceOccurrence)
+                {
+                    continue;
+                }
+
+                if (!TryWriteUInt32(ctx, destinationEntryAddress + sizeof(uint), sourceValue))
+                {
+                    return false;
+                }
+
+                break;
+            }
+
+            sourceOccurrence++;
+        }
+
+        return true;
+    }
+
     private static uint Pm4(uint lengthDwords, uint op, uint register) =>
         0xC0000000u |
         ((((ushort)lengthDwords - 2u) & 0x3FFFu) << 16) |
@@ -10991,6 +11696,17 @@ public static partial class AgcExports
         // Global predication toggle on a packet; a no-op is safe for rendering.
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "BfBDZGbti7A",
+        ExportName = "sceAgcGetIsTrinityMode",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GetIsTrinityMode(CpuContext ctx)
+    {
+        // SharpEmu currently exposes the base PS5 GPU profile, not the Trinity/PS5 Pro profile.
+        return ctx.SetReturn(0);
     }
 
     // ABI (reversed from Quake): rdi = array of DCB base addresses (u64 each),

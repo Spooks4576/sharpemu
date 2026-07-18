@@ -1129,6 +1129,12 @@ public static partial class Gen5SpirvTranslator
                     _subgroupInvocationIdInput,
                     SpirvDecoration.BuiltIn,
                     (uint)SpirvBuiltIn.SubgroupLocalInvocationId);
+                if (_stage == Gen5SpirvStage.Pixel)
+                {
+                    _module.AddDecoration(
+                        _subgroupInvocationIdInput,
+                        SpirvDecoration.Flat);
+                }
                 _interfaces.Add(_subgroupInvocationIdInput);
 
                 if (_emulateWave64)
@@ -1140,10 +1146,16 @@ public static partial class Gen5SpirvTranslator
                         _subgroupSizeInput,
                         SpirvDecoration.BuiltIn,
                         (uint)SpirvBuiltIn.SubgroupSize);
+                    if (_stage == Gen5SpirvStage.Pixel)
+                    {
+                        _module.AddDecoration(
+                            _subgroupSizeInput,
+                            SpirvDecoration.Flat);
+                    }
                     _interfaces.Add(_subgroupSizeInput);
                 }
 
-                if (_waveLaneCount == 64)
+                if (_stage == Gen5SpirvStage.Compute && _waveLaneCount == 64)
                 {
                     _localInvocationIndexInput = _module.AddGlobalVariable(
                         subgroupPointer,
@@ -1847,6 +1859,25 @@ public static partial class Gen5SpirvTranslator
 
             switch (instruction.Opcode)
             {
+                case "DsWriteAddtidB32":
+                {
+                    if (instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS write-addtid source";
+                        return false;
+                    }
+
+                    // GFX10 DS_WRITE_ADDTID_B32 has no address VGPR. Its byte
+                    // address is the 16-bit immediate plus 4 * the current
+                    // hardware thread ID. This is commonly emitted when an
+                    // export shader stages one dword per lane for the GS.
+                    var offset = control.Offset0 | (control.Offset1 << 8);
+                    var laneAddress = ShiftLeftLogical(GuestWaveLane(), UInt(2));
+                    StoreLds(
+                        LdsPointer(laneAddress, offset),
+                        GetRawSource(instruction, 0));
+                    return true;
+                }
                 case "DsWriteB32":
                 {
                     if (instruction.Sources.Count < 2)
@@ -5347,12 +5378,12 @@ public static partial class Gen5SpirvTranslator
                 instruction.Destinations.Any(IsWaveMaskOperand));
 
         private bool UsesSubgroupOperations() =>
-            _stage == Gen5SpirvStage.Compute &&
-            (UsesSubgroupShuffle() ||
+            UsesSubgroupShuffle() ||
              UsesSubgroupBroadcast() ||
              UsesWaveControl() ||
              _state.Program.Instructions.Any(static instruction =>
-                 instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32"));
+                 instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32" or
+                     "DsWriteAddtidB32");
 
         private static bool IsWaveMaskOperand(Gen5Operand operand) =>
             operand.Kind == Gen5OperandKind.ScalarRegister &&

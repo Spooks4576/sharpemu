@@ -1157,7 +1157,17 @@ public static class KernelPthreadExtendedCompatExports
         {
             lock (rwlock.SyncRoot)
             {
-                if (rwlock.RemoveCompatWriter(currentThreadId))
+                // A PS5 rwlock writer may take a nested read lock. Match the
+                // guest/Kyty ordering by releasing that read acquisition
+                // before releasing the writer ownership itself.
+                if (rwlock.RemoveReader(currentThreadId))
+                {
+                    if (rwlock.ReaderTotalCount == 0 || rwlock.WaitingWriters > 0)
+                    {
+                        Monitor.PulseAll(rwlock.SyncRoot);
+                    }
+                }
+                else if (rwlock.RemoveCompatWriter(currentThreadId))
                 {
                     Monitor.PulseAll(rwlock.SyncRoot);
                 }
@@ -1165,13 +1175,6 @@ public static class KernelPthreadExtendedCompatExports
                 {
                     rwlock.WriterThreadId = 0;
                     Monitor.PulseAll(rwlock.SyncRoot);
-                }
-                else if (rwlock.RemoveReader(currentThreadId))
-                {
-                    if (rwlock.ReaderTotalCount == 0 || rwlock.WaitingWriters > 0)
-                    {
-                        Monitor.PulseAll(rwlock.SyncRoot);
-                    }
                 }
                 else
                 {
@@ -1512,11 +1515,6 @@ public static class KernelPthreadExtendedCompatExports
             }
             else
             {
-                if (rwlock.WriterThreadId == currentThreadId)
-                {
-                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
-                }
-
                 while (ReaderMustWaitForRwlock(rwlock, currentThreadId))
                 {
                     if (GuestThreadExecution.IsGuestThread &&
@@ -1590,7 +1588,11 @@ public static class KernelPthreadExtendedCompatExports
 
     private static bool ReaderMustWaitForRwlock(PthreadRwlockState rwlock, ulong currentThreadId)
     {
-        if (rwlock.WriterThreadId != 0)
+        // Orbis/Kyty permit the owning writer to acquire a nested read lock.
+        // Returning EDEADLK here sent UE's task graph into a hot retry loop;
+        // unlock must remove the nested reader before writer ownership.
+        if (rwlock.WriterThreadId != 0 &&
+            rwlock.WriterThreadId != currentThreadId)
         {
             return true;
         }

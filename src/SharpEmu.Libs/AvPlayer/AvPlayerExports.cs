@@ -40,6 +40,7 @@ public static class AvPlayerExports
         public bool Paused { get; set; }
         public bool Looping { get; set; }
         public bool EndOfStream { get; set; }
+        public bool UseSoftwareDecoder2 { get; set; }
         public Process? Decoder { get; set; }
         public Stream? DecoderOutput { get; set; }
         public Process? AudioDecoder { get; set; }
@@ -156,11 +157,19 @@ public static class AvPlayerExports
         var dataAddress = ctx[CpuRegister.Rsi];
         lock (StateGate)
         {
-            return SetReturn(
-                ctx,
-                handle != 0 && dataAddress != 0 && Players.ContainsKey(handle)
-                    ? 0
-                    : InvalidParameters);
+            if (handle == 0 || !Players.TryGetValue(handle, out var player))
+            {
+                return SetReturn(ctx, InvalidParameters);
+            }
+
+            // AvPlayerPostInitData::video_decoder_init starts at +8. Decoder type 1
+            // is AvPlayerVideoDecoderSoftware2, whose output dimensions are not
+            // rounded to 16 pixels. A null post-init block is valid.
+            player.UseSoftwareDecoder2 = dataAddress != 0 &&
+                TryReadUInt32(ctx, dataAddress + 8, out var decoderType) &&
+                decoderType == 1;
+            Trace($"post_init handle=0x{handle:X16} software2={player.UseSoftwareDecoder2}");
+            return SetReturn(ctx, 0);
         }
     }
 
@@ -186,7 +195,7 @@ public static class AvPlayerExports
             Players.Add(handle, new PlayerState
             {
                 Handle = handle,
-                AutoStart = TryReadByte(ctx, initDataAddress + 164, out var autoStart) && autoStart != 0,
+                AutoStart = TryReadByte(ctx, initDataAddress + 116, out var autoStart) && autoStart != 0,
                 AllocatorObject = TryReadUInt64(ctx, initDataAddress + 8, out var allocatorObject) ? allocatorObject : 0,
                 AllocateTextureCallback = TryReadUInt64(ctx, initDataAddress + 32, out var allocateTexture) ? allocateTexture : 0,
                 EventObject = TryReadUInt64(ctx, initDataAddress + 88, out var eventObject) ? eventObject : 0,
@@ -661,6 +670,11 @@ public static class AvPlayerExports
 
             var fps = Math.Max(1.0, player.FramesPerSecond);
             var expectedFrame = (long)Math.Floor(player.PlaybackClock.Elapsed.TotalSeconds * fps);
+            if (!IsVideoFrameDue(player.NextFrameIndex, expectedFrame))
+            {
+                return SetReturn(ctx, 0);
+            }
+
             while (player.NextFrameIndex < expectedFrame)
             {
                 if (!ReadFrame(player))
@@ -686,6 +700,9 @@ public static class AvPlayerExports
             return SetReturn(ctx, 1);
         }
     }
+
+    internal static bool IsVideoFrameDue(long nextFrameIndex, long expectedFrameIndex) =>
+        nextFrameIndex <= expectedFrameIndex;
 
     private static int FinishStream(CpuContext ctx, PlayerState player)
     {
@@ -884,9 +901,10 @@ public static class AvPlayerExports
             return false;
         }
 
-        var alignedWidth = AlignUp(player.Width, 16);
-        var alignedHeight = AlignUp(player.Height, 16);
-        var bufferStride = checked(alignedWidth * alignedHeight * 3 / 2);
+        var outputWidth = player.UseSoftwareDecoder2 ? player.Width : AlignUp(player.Width, 16);
+        var outputHeight = player.UseSoftwareDecoder2 ? player.Height : AlignUp(player.Height, 16);
+        var pitch = AlignUp(outputWidth, 256);
+        var bufferStride = checked(pitch * outputHeight * 3 / 2);
         if (player.GuestBuffers[0] == 0)
         {
             if (!AllocateGuestVideoBuffers(ctx, player, bufferStride))
@@ -897,21 +915,25 @@ public static class AvPlayerExports
         }
 
         var frameData = player.RawFrame;
-        if (!extended && (alignedWidth != player.Width || alignedHeight != player.Height))
+        if (pitch != player.Width || outputHeight != player.Height)
         {
             player.PaddedFrame ??= new byte[bufferStride];
+            if (player.PaddedFrame.Length != bufferStride)
+            {
+                player.PaddedFrame = new byte[bufferStride];
+            }
             player.PaddedFrame.AsSpan().Clear();
             for (var row = 0; row < player.Height; row++)
             {
                 player.RawFrame.AsSpan(row * player.Width, player.Width)
-                    .CopyTo(player.PaddedFrame.AsSpan(row * alignedWidth, player.Width));
+                    .CopyTo(player.PaddedFrame.AsSpan(row * pitch, player.Width));
             }
             var rawChromaOffset = player.Width * player.Height;
-            var paddedChromaOffset = alignedWidth * alignedHeight;
+            var paddedChromaOffset = pitch * outputHeight;
             for (var row = 0; row < player.Height / 2; row++)
             {
                 player.RawFrame.AsSpan(rawChromaOffset + (row * player.Width), player.Width)
-                    .CopyTo(player.PaddedFrame.AsSpan(paddedChromaOffset + (row * alignedWidth), player.Width));
+                    .CopyTo(player.PaddedFrame.AsSpan(paddedChromaOffset + (row * pitch), player.Width));
             }
             frameData = player.PaddedFrame;
         }
@@ -930,14 +952,20 @@ public static class AvPlayerExports
         info.Clear();
         BinaryPrimitives.WriteUInt64LittleEndian(info[0..], bufferAddress);
         BinaryPrimitives.WriteUInt64LittleEndian(info[16..], timestamp);
-        BinaryPrimitives.WriteUInt32LittleEndian(info[24..], checked((uint)(extended ? player.Width : alignedWidth)));
-        BinaryPrimitives.WriteUInt32LittleEndian(info[28..], checked((uint)(extended ? player.Height : alignedHeight)));
-        BinaryPrimitives.WriteSingleLittleEndian(info[32..], 1.0f);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[24..], checked((uint)outputWidth));
+        BinaryPrimitives.WriteUInt32LittleEndian(info[28..], checked((uint)outputHeight));
+        BinaryPrimitives.WriteSingleLittleEndian(info[32..], (float)player.Width / player.Height);
+        info[36] = (byte)'u';
+        info[37] = (byte)'n';
+        info[38] = (byte)'d';
         if (extended)
         {
-            BinaryPrimitives.WriteUInt32LittleEndian(info[60..], checked((uint)player.Width));
+            BinaryPrimitives.WriteUInt32LittleEndian(info[48..], checked((uint)(pitch - player.Width)));
+            BinaryPrimitives.WriteUInt32LittleEndian(info[56..], checked((uint)(outputHeight - player.Height)));
+            BinaryPrimitives.WriteUInt32LittleEndian(info[60..], checked((uint)pitch));
             info[64] = 8;
             info[65] = 8;
+            BinaryPrimitives.WriteDoubleLittleEndian(info[72..], player.FramesPerSecond);
         }
         return ctx.Memory.TryWrite(infoAddress, info);
     }
@@ -1009,7 +1037,9 @@ public static class AvPlayerExports
         {
             return false;
         }
-        var ffprobe = Path.Combine(Path.GetDirectoryName(ffmpeg) ?? string.Empty, "ffprobe");
+        var ffprobe = Path.Combine(
+            Path.GetDirectoryName(ffmpeg) ?? string.Empty,
+            OperatingSystem.IsWindows() ? "ffprobe.exe" : "ffprobe");
         if (!File.Exists(ffprobe))
         {
             return false;
@@ -1095,10 +1125,59 @@ public static class AvPlayerExports
     private static string? FindFfmpeg()
     {
         var configured = Environment.GetEnvironmentVariable("SHARPEMU_FFMPEG_PATH");
-        if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured))
+        if (!string.IsNullOrWhiteSpace(configured))
         {
-            return configured;
+            if (File.Exists(configured))
+            {
+                return configured;
+            }
+
+            var configuredExecutable = Path.Combine(
+                configured,
+                OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg");
+            if (Directory.Exists(configured) && File.Exists(configuredExecutable))
+            {
+                return configuredExecutable;
+            }
         }
+
+        var executableName = OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg";
+        var pathValues = OperatingSystem.IsWindows()
+            ? new[]
+            {
+                Environment.GetEnvironmentVariable("PATH"),
+                Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User),
+                Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.Machine),
+            }
+            : new[] { Environment.GetEnvironmentVariable("PATH") };
+        foreach (var pathValue in pathValues)
+        {
+            if (string.IsNullOrWhiteSpace(pathValue))
+            {
+                continue;
+            }
+
+            foreach (var directory in pathValue.Split(
+                         Path.PathSeparator,
+                         StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                try
+                {
+                    var candidate = Path.Combine(directory.Trim('"'), executableName);
+                    if (File.Exists(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+                catch (Exception exception) when (exception is ArgumentException or
+                                                     NotSupportedException or
+                                                     PathTooLongException)
+                {
+                    // Ignore malformed host PATH entries and continue searching.
+                }
+            }
+        }
+
         foreach (var candidate in new[] { "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg" })
         {
             if (File.Exists(candidate))

@@ -613,6 +613,32 @@ public static partial class KernelMemoryCompatExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
     public static int KernelAioWaitRequests(CpuContext ctx) => KernelAioComplete(ctx);
 
+    [SysAbiExport(Nid = "2pOuoWoCxdk", ExportName = "sceKernelAioPollRequest",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+    public static int KernelAioPollRequest(CpuContext ctx) => KernelAioCompleteSingle(ctx);
+
+    [SysAbiExport(Nid = "KOF-oJbQVvc", ExportName = "sceKernelAioWaitRequest",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+    public static int KernelAioWaitRequest(CpuContext ctx) => KernelAioCompleteSingle(ctx);
+
+    private static int KernelAioCompleteSingle(CpuContext ctx)
+    {
+        // Submission performs the I/O synchronously. The single-request ABI is
+        // (submitId, state*, timeoutUsec*), so report the completed state through
+        // RSI; leaving it untouched makes savedata clients wait indefinitely.
+        var stateAddress = ctx[CpuRegister.Rsi];
+        Span<byte> state = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(state, AioStateCompleted);
+        if (stateAddress == 0 || !ctx.Memory.TryWrite(stateAddress, state))
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     private static int KernelAioComplete(CpuContext ctx)
     {
         // Submission already performed the I/O synchronously, so every request

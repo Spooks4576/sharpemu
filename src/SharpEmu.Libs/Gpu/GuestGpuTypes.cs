@@ -61,7 +61,8 @@ internal sealed record GuestIndexBuffer(
     byte[] Data,
     int Length,
     bool Is32Bit,
-    bool Pooled);
+    bool Pooled,
+    int VertexOffset = 0);
 
 internal readonly record struct GuestRect(
     int X,

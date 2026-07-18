@@ -1760,13 +1760,16 @@ public sealed partial class DirectExecutionBackend
 		return elapsedTicks >= (long)(_importLoopGuardSeconds * Stopwatch.Frequency);
 	}
 
-	private static bool IsImportLoopGuardBoundary(string nid) =>
+	internal static bool IsImportLoopGuardBoundary(string nid) =>
 		nid is
 			"1jfXLRVzisc" or // sceKernelUsleep
 			"WKAXJ4XBPQ4" or // scePthreadCondWait
 			"BmMjYxmew1w" or // scePthreadCondTimedwait
 			"Op8TBGY5KHg" or // pthread_cond_wait
-			"27bAgiJmOh0";   // pthread_cond_timedwait
+			"27bAgiJmOh0" or // pthread_cond_timedwait
+			"ejekcaNQNq0" or // sceKernelGettimeofday
+			"n88vx3C5nW8" or // gettimeofday
+			"lLMT9vJAck0";   // clock_gettime
 
 	private void ResetImportLoopPattern()
 	{

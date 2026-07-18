@@ -1251,6 +1251,7 @@ public static class Gen5ShaderTranslator
             0x37 => "DsRead2B32",
             0x38 => "DsRead2St64B32",
             0x4D => "DsWriteB64",
+            0xB0 => "DsWriteAddtidB32",
             0xDE => "DsWriteB96",
             0xDF => "DsWriteB128",
             0xFE => "DsReadB96",
@@ -1975,7 +1976,9 @@ public static class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData0),
                         Gen5Operand.Vector(vectorData1),
                     ],
-                    "DsSwizzleB32" => [Gen5Operand.Vector(vectorData0)],
+                    "DsSwizzleB32" or "DsWriteAddtidB32" => [
+                        Gen5Operand.Vector(vectorData0),
+                    ],
                     // DS_CMPST operand order is reversed vs buffer/image cmpswap:
                     // DATA0 holds the comparator, DATA1 holds the new value.
                     "DsCmpstB32" or "DsCmpstRtnB32" => [

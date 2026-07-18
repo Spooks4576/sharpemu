@@ -679,10 +679,11 @@ public static class KernelPthreadCompatExports
                     // Several Gen5 runtimes layer their own owner/count bookkeeping
                     // over a NORMAL or ADAPTIVE kernel mutex. Returning EDEADLK here
                     // leaves that guest bookkeeping out of sync with the HLE owner and
-                    // turns the wrapper into a permanent lock/unlock retry loop. Keep
-                    // the compatibility recursion used by the original implementation;
-                    // ERRORCHECK mutexes still take the strict EDEADLK path below.
-                    state.RecursionCount++;
+                    // turns the wrapper into a permanent lock/unlock retry loop.
+                    // Treat the redundant kernel lock as an idempotent compatibility
+                    // success: the guest wrapper owns the nested depth, so adding HLE
+                    // recursion here leaks ownership when it emits only one kernel
+                    // unlock. ERRORCHECK mutexes still take the strict EDEADLK path.
                     TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 }
