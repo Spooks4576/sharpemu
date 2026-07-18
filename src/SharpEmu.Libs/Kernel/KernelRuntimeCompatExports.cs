@@ -332,10 +332,28 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int KernelGetProcessTime(CpuContext ctx)
     {
+        ctx[CpuRegister.Rax] = GetProcessTimeMicroseconds();
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Timestamp sources shared with HLE modules whose guest-visible structs
+    // must stay in the same timebase as the kernel time exports (VideoOut
+    // flip/vblank status feeds UE frame pacing math that mixes both).
+    internal static ulong GetProcessTimeMicroseconds()
+    {
         var elapsedTicks = Stopwatch.GetTimestamp() - _processStartCounter;
         var micros = elapsedTicks * 1_000_000L / Stopwatch.Frequency;
-        ctx[CpuRegister.Rax] = unchecked((ulong)Math.Max(0, micros));
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return unchecked((ulong)Math.Max(0, micros));
+    }
+
+    internal static ulong ReadTscValue()
+    {
+        if (TryReadHostTsc(out var counter))
+        {
+            return counter;
+        }
+
+        return unchecked((ulong)Math.Max(0, Stopwatch.GetTimestamp()));
     }
 
     [SysAbiExport(

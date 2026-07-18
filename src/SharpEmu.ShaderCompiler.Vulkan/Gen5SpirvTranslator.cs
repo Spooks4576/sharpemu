@@ -1129,6 +1129,12 @@ public static partial class Gen5SpirvTranslator
                     _subgroupInvocationIdInput,
                     SpirvDecoration.BuiltIn,
                     (uint)SpirvBuiltIn.SubgroupLocalInvocationId);
+                if (_stage == Gen5SpirvStage.Pixel)
+                {
+                    _module.AddDecoration(
+                        _subgroupInvocationIdInput,
+                        SpirvDecoration.Flat);
+                }
                 _interfaces.Add(_subgroupInvocationIdInput);
 
                 if (_emulateWave64)
@@ -1140,10 +1146,16 @@ public static partial class Gen5SpirvTranslator
                         _subgroupSizeInput,
                         SpirvDecoration.BuiltIn,
                         (uint)SpirvBuiltIn.SubgroupSize);
+                    if (_stage == Gen5SpirvStage.Pixel)
+                    {
+                        _module.AddDecoration(
+                            _subgroupSizeInput,
+                            SpirvDecoration.Flat);
+                    }
                     _interfaces.Add(_subgroupSizeInput);
                 }
 
-                if (_waveLaneCount == 64)
+                if (_stage == Gen5SpirvStage.Compute && _waveLaneCount == 64)
                 {
                     _localInvocationIndexInput = _module.AddGlobalVariable(
                         subgroupPointer,
@@ -5347,12 +5359,11 @@ public static partial class Gen5SpirvTranslator
                 instruction.Destinations.Any(IsWaveMaskOperand));
 
         private bool UsesSubgroupOperations() =>
-            _stage == Gen5SpirvStage.Compute &&
-            (UsesSubgroupShuffle() ||
+            UsesSubgroupShuffle() ||
              UsesSubgroupBroadcast() ||
              UsesWaveControl() ||
              _state.Program.Instructions.Any(static instruction =>
-                 instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32"));
+                 instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32");
 
         private static bool IsWaveMaskOperand(Gen5Operand operand) =>
             operand.Kind == Gen5OperandKind.ScalarRegister &&

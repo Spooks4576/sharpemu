@@ -1874,6 +1874,35 @@ internal static unsafe class VulkanVideoPresenter
             ? 0x8000_0000u | ((format & 0x1FFu) << 8) | (numberType & 0xFFu)
             : 0;
 
+    internal static ulong GetGuestSurfaceByteCount(uint format, uint width, uint height)
+    {
+        var bytesPerTexel = format switch
+        {
+            1 => 1UL,
+            2 or 3 => 2UL,
+            4 or 5 or 6 or 7 or 9 or 10 => 4UL,
+            11 or 12 => 8UL,
+            13 => 12UL,
+            14 => 16UL,
+            _ => 0UL,
+        };
+        if (bytesPerTexel != 0)
+        {
+            return checked((ulong)width * height * bytesPerTexel);
+        }
+
+        var blockBytes = format switch
+        {
+            169 or 170 or 175 or 176 => 8UL,
+            171 or 172 or 173 or 174 or
+            177 or 178 or 179 or 180 or 181 or 182 => 16UL,
+            _ => 0UL,
+        };
+        return blockBytes == 0
+            ? 0
+            : checked(((ulong)width + 3) / 4 * (((ulong)height + 3) / 4) * blockBytes);
+    }
+
     internal static bool TryDecodeRenderTargetFormat(
         uint dataFormat,
         uint numberType,
@@ -2900,6 +2929,7 @@ internal static unsafe class VulkanVideoPresenter
             public VkBuffer IndexBuffer;
             public DeviceMemory IndexMemory;
             public bool Index32Bit;
+            public int IndexVertexOffset;
             public uint VertexCount = 3;
             public uint InstanceCount = 1;
             public PrimitiveTopology Topology = PrimitiveTopology.TriangleList;
@@ -4918,6 +4948,7 @@ internal static unsafe class VulkanVideoPresenter
                 }
             }
 
+            var anyRetired = false;
             while (_pendingGuestSubmissions.TryPeek(out var submission))
             {
                 var status = _vk.GetFenceStatus(_device, submission.Fence);
@@ -4964,6 +4995,20 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     _completedTimeline = submission.Timeline;
                 }
+
+                anyRetired = true;
+            }
+
+            if (anyRetired)
+            {
+                // Publish retired GPU buffer stores to guest memory as they
+                // complete, not only at rare structural sync points. The
+                // guest CPU polls GPU results through ordinary memory (UE5
+                // reads the eye-adaptation exposure back and writes it into
+                // the next frame's view constants); values that only ever
+                // live in host allocations leave it reading zeros forever,
+                // and the whole scene chain multiplies to black.
+                WriteBackAllDirtyGuestBuffers();
             }
 
             ProcessDeferredTextureDestroys();
@@ -5416,6 +5461,32 @@ internal static unsafe class VulkanVideoPresenter
                         $"vk.flip_retired version={unsubmittedVersion.FlipVersion} " +
                         $"frame_slot={slot} reason=frame-not-submitted");
                 }
+                return true;
+            }
+
+            if (_deviceLost)
+            {
+                // A lost device never signals its pending fences. Teardown
+                // must abandon the fence and retire CPU-side ownership instead
+                // of throwing another device-lost exception from the window's
+                // close callback.
+                _frameFencePending[slot] = false;
+                if (_frameTranslatedResources[slot] is { } abandonedResources)
+                {
+                    _frameTranslatedResources[slot] = null;
+                    DestroyTranslatedDrawResources(abandonedResources);
+                }
+
+                if (_frameGuestImageVersions[slot] is { } abandonedVersion)
+                {
+                    _frameGuestImageVersions[slot] = null;
+                    _capturedGuestFlipVersions.Remove(abandonedVersion.FlipVersion);
+                    DestroyGuestImage(abandonedVersion);
+                    TraceVulkanShader(
+                        $"vk.flip_retired version={abandonedVersion.FlipVersion} " +
+                        $"frame_slot={slot} reason=device-lost");
+                }
+
                 return true;
             }
 
@@ -5962,6 +6033,7 @@ internal static unsafe class VulkanVideoPresenter
                         out resources.IndexMemory,
                         out _);
                     resources.Index32Bit = indexBuffer.Is32Bit;
+                    resources.IndexVertexOffset = indexBuffer.VertexOffset;
                     if (indexBuffer.Pooled)
                     {
                         GuestDataPool.Return(indexBuffer.Data);
@@ -7607,6 +7679,27 @@ internal static unsafe class VulkanVideoPresenter
                 !_guestImages.ContainsKey(texture.Address))
             {
                 var guestFormat = GetGuestTextureFormat(texture.Format, texture.NumberType);
+                var attachmentView = view;
+                if (texture.DstSelect != 0xFAC)
+                {
+                    viewInfo.Components = new ComponentMapping(
+                        ComponentSwizzle.Identity,
+                        ComponentSwizzle.Identity,
+                        ComponentSwizzle.Identity,
+                        ComponentSwizzle.Identity);
+                    Check(
+                        _vk.CreateImageView(
+                            _device,
+                            &viewInfo,
+                            null,
+                            out attachmentView),
+                        "vkCreateImageView(texture attachment)");
+                    SetDebugName(
+                        ObjectType.ImageView,
+                        attachmentView.Handle,
+                        $"{debugName} attachment view");
+                }
+
                 var guestImage = new GuestImageResource
                 {
                     Address = texture.Address,
@@ -7617,12 +7710,22 @@ internal static unsafe class VulkanVideoPresenter
                     Format = vkFormat,
                     Image = image,
                     Memory = imageMemory,
-                    View = view,
+                    // Framebuffer attachments must use an identity component
+                    // mapping. Keep the descriptor's swizzle only in the
+                    // sampled-view cache when a CPU-backed texture is later
+                    // promoted to a render target at the same address.
+                    View = attachmentView,
                     InitialUploadPending = true,
                     IsCpuBacked = true,
                     CpuContentFingerprint = contentFingerprint,
                     SupportsStorageUsage = supportsStorageUsage,
                 };
+                if (attachmentView.Handle != view.Handle)
+                {
+                    guestImage.FormatViews.Add(
+                        (vkFormat, 0, 1, texture.DstSelect),
+                        view);
+                }
                 _guestImages.Add(texture.Address, guestImage);
                 resource.OwnsStorage = false;
                 resource.GuestImage = guestImage;
@@ -8249,7 +8352,21 @@ internal static unsafe class VulkanVideoPresenter
                 // HOST_VISIBLE|HOST_COHERENT (write-combined on most drivers),
                 // so CPU reads from it are uncached and orders of magnitude
                 // slower than heap reads — never use it as a copy source.
-                if (_guestMemory?.TryRead(guestBuffer.BaseAddress, shadow) != true)
+                //
+                // Only an all-zero parse snapshot re-reads live guest bytes:
+                // the guest had not written the range when the command list was
+                // parsed (queues parse ahead of the CPU's late writes). A
+                // NON-zero snapshot is the value the draw was recorded with — by
+                // execution time the guest has often recycled the transient
+                // constant slot for a later frame (and UE5's exposure-copy input
+                // reads zero), so an unconditional re-read hands this dispatch a
+                // different draw's constants.
+                if (source.IndexOfAnyExcept((byte)0) < 0 &&
+                    _guestMemory?.TryRead(guestBuffer.BaseAddress, shadow) == true)
+                {
+                    // shadow now holds the live guest bytes.
+                }
+                else
                 {
                     source.CopyTo(shadow);
                 }
@@ -8257,6 +8374,49 @@ internal static unsafe class VulkanVideoPresenter
                 shadow.CopyTo(new Span<byte>(
                     (void*)(allocation.Mapped + checked((nint)guestOffset)),
                     guestBuffer.Length));
+            }
+            else if (!guestBuffer.Writable &&
+                     source.IndexOfAnyExcept((byte)0) < 0 &&
+                     new ReadOnlySpan<byte>(
+                         (void*)(allocation.Mapped + checked((nint)guestOffset)),
+                         guestBuffer.Length).IndexOfAnyExcept((byte)0) < 0)
+            {
+                // All-zero parse snapshot, shadow, AND mapped bytes: the guest
+                // had not written this range when the command list was parsed
+                // (queues parse ahead of the CPU's late writes), no upload has
+                // seeded the shared allocation since, and no GPU store has
+                // produced it in place, so the bind would hand the shader stale
+                // zeros (UE5's exposure copy then multiplies the whole frame to
+                // black). Nonzero mapped bytes mean a GPU producer already
+                // stored the value into this shared allocation — bind as-is.
+                // Otherwise refresh from live guest bytes, publishing pending
+                // GPU write-backs first so a producer's value that only exists
+                // on the ordered timeline is not missed. A recycled transient
+                // ring entry is never all-zero at parse, so this cannot
+                // reintroduce stale-ring corruption.
+                var live = new byte[guestBuffer.Length];
+                var haveLive =
+                    _guestMemory?.TryRead(guestBuffer.BaseAddress, live) == true &&
+                    live.AsSpan().IndexOfAnyExcept((byte)0) >= 0;
+                if (!haveLive && allocation.DirtyRanges.Count != 0)
+                {
+                    WaitForAllGuestSubmissionsForCpuVisibility();
+                    WriteBackAllDirtyGuestBuffers();
+                    haveLive =
+                        _guestMemory?.TryRead(guestBuffer.BaseAddress, live) == true &&
+                        live.AsSpan().IndexOfAnyExcept((byte)0) >= 0;
+                }
+
+                if (haveLive)
+                {
+                    WaitForAllGuestSubmissionsForCpuVisibility();
+                    WriteBackAllDirtyGuestBuffers();
+                    _ = _guestMemory?.TryRead(guestBuffer.BaseAddress, live);
+                    live.AsSpan().CopyTo(new Span<byte>(
+                        (void*)(allocation.Mapped + checked((nint)guestOffset)),
+                        live.Length));
+                    live.AsSpan().CopyTo(shadow);
+                }
             }
 
             if (ShouldTraceVulkanResources() &&
@@ -8421,7 +8581,14 @@ internal static unsafe class VulkanVideoPresenter
             {
                 // Growing/merging an aliased allocation is rare. Synchronize
                 // only this structural transition so no in-flight descriptor
-                // can observe storage being replaced underneath it.
+                // can observe storage being replaced underneath it. The open
+                // recording batch must be submitted first: a batched producer
+                // (UE5's eye-adaptation buffer store) still references the
+                // allocation being replaced, and only submission marks its
+                // writable ranges dirty — without it the write-back below
+                // publishes nothing and the producer's value dies with the
+                // destroyed allocation (consumers then read zero exposure).
+                FlushBatchedGuestCommands();
                 WaitForAllGuestSubmissionsForCpuVisibility();
                 WriteBackAllDirtyGuestBuffers();
             }
@@ -10181,10 +10348,8 @@ internal static unsafe class VulkanVideoPresenter
                         : work.Targets[index];
                 targets[index] = GetOrCreateGuestImage(targetDescriptor, formats[index]);
                 if (work.Targets[index].Address != 0 &&
-                    TakeGuestImageInitialData(work.Targets[index].Address) is { } initialData &&
                     !targets[index].Initialized &&
-                    (ulong)initialData.Length ==
-                        (ulong)targets[index].Width * targets[index].Height * 4)
+                    TakeGuestImageInitialData(work.Targets[index].Address) is { } initialData)
                 {
                     UploadGuestImageInitialData(targets[index], initialData);
                 }
@@ -10734,6 +10899,23 @@ internal static unsafe class VulkanVideoPresenter
         private void UploadGuestImageInitialData(GuestImageResource target, byte[] pixels)
         {
             var byteCount = (ulong)pixels.Length;
+            var dataFormat = (target.GuestFormat >> 8) & 0x1FFu;
+            var expectedByteCount = GetGuestSurfaceByteCount(
+                dataFormat,
+                target.Width,
+                target.Height);
+            if ((target.GuestFormat & 0x8000_0000u) == 0 ||
+                expectedByteCount == 0 ||
+                byteCount != expectedByteCount)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] Vulkan skipped guest image upload with mismatched footprint " +
+                    $"addr=0x{target.Address:X16} format={dataFormat} " +
+                    $"size={target.Width}x{target.Height} " +
+                    $"bytes={byteCount} expected={expectedByteCount}.");
+                return;
+            }
+
             var staging = CreateBuffer(
                 byteCount,
                 BufferUsageFlags.TransferSrcBit,
@@ -14024,7 +14206,7 @@ internal static unsafe class VulkanVideoPresenter
                         resources.VertexCount,
                         resources.InstanceCount,
                         0,
-                        0,
+                        resources.IndexVertexOffset,
                         0);
                 }
                 else
