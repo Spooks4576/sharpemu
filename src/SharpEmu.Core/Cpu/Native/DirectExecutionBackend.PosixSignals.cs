@@ -303,6 +303,50 @@ public sealed unsafe partial class DirectExecutionBackend
 		else if (signal == PosixSigTrap)
 		{
 			record.ExceptionCode = 2147483651u;
+
+				// UE log tap: our detour trampolines start with a registered int3.
+				// Read the pristine formatter args, render the line, then resume the
+				// real formatter (its relocated prologue is right after the int3).
+				var trapRip = ReadCtxU64(contextRecord, CTX_RIP);
+				if (SharpEmu.Core.Diagnostics.UeLogHook.IsEnabled &&
+					SharpEmu.Core.Diagnostics.UeLogHook.TryGetTrapResume(trapRip, out _) &&
+					_posixSignalBackend is { } logBackend &&
+					logBackend.ActiveCpuContext?.Memory is { } logMemory)
+				{
+					Span<ulong> xmm = stackalloc ulong[8];
+					for (var k = 0; k < 8; k++)
+					{
+						xmm[k] = *(ulong*)(contextRecord + Win64ContextXmm0Offset + k * 16);
+					}
+
+					SharpEmu.Core.Diagnostics.UeLogHook.HandleTrap(
+						ReadCtxU64(contextRecord, CTX_RSI),
+						ReadCtxU64(contextRecord, CTX_RDX),
+						ReadCtxU64(contextRecord, CTX_RCX),
+						ReadCtxU64(contextRecord, CTX_R8),
+						ReadCtxU64(contextRecord, CTX_R9),
+						ReadCtxU64(contextRecord, CTX_RSP),
+						xmm,
+						(ulong address, Span<byte> destination) => logMemory.TryRead(address, destination));
+
+					// RIP already points past the int3 (at the relocated prologue);
+					// just resume — do not advance it again.
+					for (int i = 0; i < offsets.Length; i++)
+					{
+						*(ulong*)(registers + offsets[i]) = ReadCtxU64(contextRecord, CTX_RAX + i * 8);
+					}
+
+					if (fpstate != null)
+					{
+						Buffer.MemoryCopy(
+							contextRecord + Win64ContextXmm0Offset,
+							fpstate + FxsaveXmmOffset,
+							XmmBlockSize,
+							XmmBlockSize);
+					}
+
+					return true;
+				}
 		}
 		else if (signal == PosixSigAbort)
 		{

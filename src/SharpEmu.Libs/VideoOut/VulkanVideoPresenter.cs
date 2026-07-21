@@ -1951,7 +1951,8 @@ internal static unsafe class VulkanVideoPresenter
             (20, 0) => Format.R32Uint,
             (29, 0) or (4, 0) => Format.R32Sfloat,
             (1, 0) or (36, 0) => Format.R8Unorm,
-            (49, 0) => Format.R8Uint,
+            (1, 4) or (49, 0) => Format.R8Uint,
+            (1, 5) => Format.R8Sint,
             (3, 0) => Format.R8G8Unorm,
             (5, 0) => Format.R16G16Unorm,
             (7, 0) => Format.B10G11R11UfloatPack32,
@@ -1973,7 +1974,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             Format.R8Uint or Format.R32Uint or Format.R16G16Uint or
                 Format.R8G8B8A8Uint or Format.R16G16B16A16Uint => Gen5PixelOutputKind.Uint,
-            Format.R32Sint or Format.R16G16Sint or Format.R8G8B8A8Sint or
+            Format.R8Sint or Format.R32Sint or Format.R16G16Sint or Format.R8G8B8A8Sint or
                 Format.R16G16B16A16Sint => Gen5PixelOutputKind.Sint,
             _ => Gen5PixelOutputKind.Float,
         };

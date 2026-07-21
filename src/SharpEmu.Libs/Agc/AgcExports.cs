@@ -50,6 +50,7 @@ public static partial class AgcExports
     private const uint ItDispatchIndirect = 0x16;
     private const uint ItWaitRegMem = 0x3C;
     private const uint ItIndirectBuffer = 0x3F;
+    private const uint MaxIndirectBufferDepth = 16;
     private const uint ItEventWrite = 0x46;
     private const uint ItReleaseMem = 0x49;
     private const uint ItDmaData = 0x50;
@@ -758,6 +759,14 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int SetUcRegIndirectPatchSetAddress(CpuContext ctx) =>
         SetIndirectPatchAddress(ctx, "uc");
+
+    [SysAbiExport(
+        Nid = "whb1RL7K4Ss",
+        ExportName = "sceAgcSetCxRegIndirectPatchSetNumRegisters",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int SetCxRegIndirectPatchSetNumRegisters(CpuContext ctx) =>
+        SetIndirectPatchNumRegisters(ctx, "cx");
 
     [SysAbiExport(
         Nid = "d-6uF9sZDIU",
@@ -1604,6 +1613,33 @@ public static partial class AgcExports
 
         TraceAgc(
             $"agc.dcb_draw_index_indirect buf=0x{commandBufferAddress:X16} " +
+            $"cmd=0x{commandAddress:X16} offset=0x{dataOffset:X8} modifier=0x{modifier:X8}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
+        Nid = "1q1titRBL6o",
+        ExportName = "sceAgcDcbDrawIndirect",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbDrawIndirect(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var dataOffset = (uint)ctx[CpuRegister.Rsi];
+        var modifier = (uint)ctx[CpuRegister.Rdx];
+        if (commandBufferAddress == 0 ||
+            !TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(5, ItDrawIndirect, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, dataOffset) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, modifier))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc(
+            $"agc.dcb_draw_indirect buf=0x{commandBufferAddress:X16} " +
             $"cmd=0x{commandAddress:X16} offset=0x{dataOffset:X8} modifier=0x{modifier:X8}");
         return ReturnPointer(ctx, commandAddress);
     }
@@ -3051,7 +3087,8 @@ public static partial class AgcExports
         SubmittedDcbState state,
         ulong commandAddress,
         uint dwordCount,
-        bool tracePackets)
+        bool tracePackets,
+        uint indirectDepth = 0)
     {
         var offset = 0u;
         while (offset < dwordCount)
@@ -3119,6 +3156,42 @@ public static partial class AgcExports
             if (_traceDraws)
             {
                 CountSubmittedOpcode(op, register);
+            }
+
+            // IT_INDIRECT_BUFFER (sceAgcDcbJump/sceAgcCbBranch) is a branch, not a
+            // call: the target buffer is this submission's continuation, so its
+            // parse result — including a suspend on a GPU wait — is ours. Layout:
+            // [header][addr_lo][addr_hi][size_dwords]; depth-guarded.
+            if (op == ItIndirectBuffer && length >= 4)
+            {
+                if (TryReadUInt32(ctx, currentAddress + 4, out var ibAddrLo) &&
+                    TryReadUInt32(ctx, currentAddress + 8, out var ibAddrHi) &&
+                    TryReadUInt32(ctx, currentAddress + 12, out var ibDwords))
+                {
+                    var ibTarget = (ulong)ibAddrLo | ((ulong)(ibAddrHi & 0xFFFFu) << 32);
+                    var ibTargetDwords = ibDwords & 0xFFFFFu;
+                    if (ibTarget != 0 && ibTargetDwords != 0)
+                    {
+                        if (indirectDepth >= MaxIndirectBufferDepth)
+                        {
+                            TracePacketParseFailure(
+                                state, currentAddress, offset, header, $"indirect-depth-{indirectDepth}");
+                            return false;
+                        }
+
+                        if (tracePackets)
+                        {
+                            TraceAgc(
+                                $"agc.dcb.indirect_follow target=0x{ibTarget:X16} dwords={ibTargetDwords} depth={indirectDepth}");
+                        }
+
+                        return ParseSubmittedDcbCore(
+                            ctx, gpuState, state, ibTarget, ibTargetDwords, tracePackets, indirectDepth + 1);
+                    }
+                }
+
+                offset += length;
+                continue;
             }
 
             if (op == ItNop &&
@@ -10612,6 +10685,27 @@ public static partial class AgcExports
         return op == ItWriteData || (op == ItNop && register == RWriteData);
     }
 
+    private static int SetIndirectPatchNumRegisters(CpuContext ctx, string registerSpace)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var registerCount = (uint)ctx[CpuRegister.Rsi];
+        if (commandAddress == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // Sibling of AddIndirectPatchRegisters, but sets the register count at
+        // +0x4 absolutely instead of accumulating.
+        if (!TryWriteUInt32(ctx, commandAddress + 4, registerCount))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceAgc($"agc.patch_{registerSpace}_setnum cmd=0x{commandAddress:X16} count={registerCount}");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     private static int AddIndirectPatchRegisters(CpuContext ctx, string registerSpace)
     {
         var commandAddress = ctx[CpuRegister.Rdi];
@@ -11343,6 +11437,47 @@ public static partial class AgcExports
 
         Console.Error.WriteLine(
             $"[LOADER][TRACE] agc.create_shader dst=0x{destinationAddress:X16} header=0x{headerAddress:X16} code=0x{codeAddress:X16} {detail}");
+    }
+
+    [SysAbiExport(
+        Nid = "w1KFAHVqpaU",
+        ExportName = "sceAgcCbBranch",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int CbBranch(CpuContext ctx)
+    {
+        // Low-level Gen5 sibling of sceAgcDcbJump: emit an IT_INDIRECT_BUFFER
+        // packet into the caller's command buffer so it branches to another
+        // buffer (followed at submit time by ParseSubmittedDcbCore). rdi points
+        // at the command-buffer struct exactly as sceAgcDcbJump's does. Confirmed
+        // by argument trace, the branch target buffer is the 2nd stack argument
+        // and its size in dwords is the 3rd. An invalid target/size emits nothing
+        // rather than a malformed packet the submit parser would reject.
+        var cb = ctx[CpuRegister.Rdi];
+        if (cb == 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        var rsp = ctx[CpuRegister.Rsp];
+        if (!TryReadUInt64(ctx, rsp + (2 * sizeof(ulong)), out var target) ||
+            !TryReadUInt64(ctx, rsp + (3 * sizeof(ulong)), out var targetDwords))
+        {
+            return ReturnPointer(ctx, cb);
+        }
+
+        var dwords = (uint)targetDwords & 0xFFFFFu;
+        if (target == 0 || dwords == 0 ||
+            !TryAllocateCommandDwords(ctx, cb, 4, out var cmd) ||
+            !ctx.TryWriteUInt32(cmd, Pm4(4, ItIndirectBuffer, RZero)) ||
+            !ctx.TryWriteUInt32(cmd + 4, (uint)(target & 0xFFFF_FFFFUL)) ||
+            !ctx.TryWriteUInt32(cmd + 8, (uint)((target >> 32) & 0xFFFFUL)) ||
+            !ctx.TryWriteUInt32(cmd + 12, dwords))
+        {
+            return ReturnPointer(ctx, cb);
+        }
+
+        return ReturnPointer(ctx, cmd);
     }
 
     [SysAbiExport(

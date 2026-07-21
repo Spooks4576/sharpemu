@@ -313,6 +313,8 @@ public sealed class SelfLoader : ISelfLoader
         }
         Console.Error.WriteLine($"[LOADER][TLS] load_done assigned={tlsModuleId} next={_nextTlsModuleId}");
 
+        SharpEmu.Core.Diagnostics.UeLogHook.TryInstall(virtualMemory, imageBase, programHeaders);
+
         return new SelfImage(
             loadContext.IsSelf,
             elfHeader,

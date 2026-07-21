@@ -1839,6 +1839,16 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+
+            // DS thread-id scatter/write2 stores per-lane data to cross-lane LDS
+            // that the graphics per-invocation model can't observe and these
+            // passes never read back. Drop them (visible output comes from texture
+            // + color exports) instead of aborting the shader to a white fallback.
+            if (instruction.Opcode is "DsWriteAddtidB32" or "DsWriteAddtidB16" or "DsWrite2B64")
+            {
+                return true;
+            }
+
             if (_lds == 0 ||
                 _ldsElementPointer == 0 ||
                 instruction.Control is not Gen5DataShareControl control)

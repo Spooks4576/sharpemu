@@ -83,6 +83,20 @@ public static class NpWebApi2Exports
     }
 
     [SysAbiExport(
+        Nid = "3Tt9zL3tkoc",
+        ExportName = "sceNpWebApi2CheckTimeout",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpWebApi2")]
+    public static int NpWebApi2CheckTimeout(CpuContext ctx)
+    {
+        // No PSN backend: there are no in-flight requests to time out. Report OK
+        // so the title's online worker completes its poll instead of spinning on
+        // an unresolved import.
+        TraceNpWebApi2("check-timeout", unchecked((int)ctx[CpuRegister.Rdi]), ctx[CpuRegister.Rsi]);
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
         Nid = "bEvXpcEk200",
         ExportName = "sceNpWebApi2Terminate",
         Target = Generation.Gen4 | Generation.Gen5,

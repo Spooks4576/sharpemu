@@ -428,7 +428,66 @@ public static class KernelPthreadCompatExports
         ExportName = "scePthreadCondTimedwait",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PthreadCondTimedwait(CpuContext ctx) => PthreadCondWaitCore(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], timed: true, timeoutUsec: unchecked((uint)ctx[CpuRegister.Rdx]));
+    public static int PthreadCondTimedwait(CpuContext ctx)
+    {
+        MaybeTraceCondWaitBacktrace(ctx, ctx[CpuRegister.Rdi]);
+        return PthreadCondWaitCore(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], timed: true, timeoutUsec: unchecked((uint)ctx[CpuRegister.Rdx]));
+    }
+
+    private static readonly HashSet<ulong> _tracedCondBacktraces = new();
+    private static readonly Dictionary<ulong, int> _condWaitCounts = new();
+
+    // Diagnostic: when SHARPEMU_TRACE_COND_BT=1, walk the guest RBP chain once
+    // for any cond that has been timed-waited more than the threshold — i.e. a
+    // cond something is stuck polling — to reveal the blocked FEvent::Wait caller.
+    private static void MaybeTraceCondWaitBacktrace(CpuContext ctx, ulong condAddress)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_COND_BT"), "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        lock (_tracedCondBacktraces)
+        {
+            if (_tracedCondBacktraces.Contains(condAddress))
+            {
+                return;
+            }
+
+            _condWaitCounts.TryGetValue(condAddress, out var count);
+            count++;
+            _condWaitCounts[condAddress] = count;
+            if (count < 20)
+            {
+                return;
+            }
+
+            _tracedCondBacktraces.Add(condAddress);
+        }
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"[LOADER][COND-BT] cond=0x{condAddress:X} frames:");
+        var rbp = ctx[CpuRegister.Rbp];
+        sb.Append($" rip_ret=0x{ctx[CpuRegister.Rsp]:X}");
+        for (var i = 0; i < 16 && rbp is > 0x10000 and < 0x8000_0000_0000; i++)
+        {
+            if (!KernelMemoryCompatExports.TryReadUInt64Compat(ctx, rbp + sizeof(ulong), out var retAddr) ||
+                !KernelMemoryCompatExports.TryReadUInt64Compat(ctx, rbp, out var nextRbp))
+            {
+                break;
+            }
+
+            sb.Append($" 0x{retAddr:X}");
+            if (nextRbp <= rbp)
+            {
+                break;
+            }
+
+            rbp = nextRbp;
+        }
+
+        Console.Error.WriteLine(sb.ToString());
+    }
 
     [SysAbiExport(
         Nid = "kDh-NfxgMtE",
@@ -1498,6 +1557,16 @@ public static class KernelPthreadCompatExports
 
             if (cooperative && timed)
             {
+                // Floor the wait to one guest-visible millisecond: guest retry
+                // loops measure elapsed time in whole ms, so a sub-ms resume lets
+                // them read "0 ms elapsed" forever and busy-spin. A timed wait may
+                // return late but never early, so this stays within semantics.
+                var timeout = GetCondWaitTimeout(timeoutUsec);
+                if (timeout < MinTimedCondWaitResolution)
+                {
+                    timeout = MinTimedCondWaitResolution;
+                }
+
                 waiter.TimeoutTimer = new Timer(
                     static callbackState =>
                     {
@@ -1505,7 +1574,7 @@ public static class KernelPthreadCompatExports
                         CompleteCondWaiter(condState, condWaiter, timedOut: true);
                     },
                     (state, waiter),
-                    GetCondWaitTimeout(timeoutUsec),
+                    timeout,
                     Timeout.InfiniteTimeSpan);
             }
         }
@@ -1919,6 +1988,10 @@ public static class KernelPthreadCompatExports
             _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(waiter.WakeKey, 1);
         }
     }
+
+    // Finest timeout resolution a guest retry loop can observe; timed cond-waits
+    // are floored to this so a sub-ms host wait cannot starve it.
+    private static readonly TimeSpan MinTimedCondWaitResolution = TimeSpan.FromMilliseconds(1);
 
     private static TimeSpan GetCondWaitTimeout(uint timeoutUsec)
     {

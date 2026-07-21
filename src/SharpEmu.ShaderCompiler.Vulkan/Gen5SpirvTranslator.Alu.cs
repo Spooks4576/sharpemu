@@ -961,6 +961,19 @@ public static partial class Gen5SpirvTranslator
                         vector);
                     break;
                 }
+                case "VCvtPkU16U32":
+                {
+                    // Unsigned-saturate each 32-bit source to 16 bits (GLSL UMin
+                    // with 0xFFFF) and pack: dst = lo | (hi << 16).
+                    var lo = Ext(38u, _uintType, GetRawSource(instruction, 0), UInt(0xFFFF));
+                    var hi = Ext(38u, _uintType, GetRawSource(instruction, 1), UInt(0xFFFF));
+                    result = _module.AddInstruction(
+                        SpirvOp.BitwiseOr,
+                        _uintType,
+                        lo,
+                        _module.AddInstruction(SpirvOp.ShiftLeftLogical, _uintType, hi, UInt(16)));
+                    break;
+                }
 
                 case "VPkAddF16":
                 case "VPkMulF16":
