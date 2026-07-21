@@ -38,6 +38,8 @@ public static class PadExports
 
     private static bool _initialized;
     private static int _controlsAnnouncementLogged;
+    private static byte _leftTriggerEffectMode;
+    private static byte _rightTriggerEffectMode;
 
     [SysAbiExport(
         Nid = "hv1luiJrqQM",
@@ -362,10 +364,49 @@ public static class PadExports
         }
 
         var triggerMask = parameter[0];
+        if ((triggerMask & 0x01) != 0)
+        {
+            _leftTriggerEffectMode = (byte)BinaryPrimitives.ReadUInt32LittleEndian(parameter[8..]);
+        }
+
+        if ((triggerMask & 0x02) != 0)
+        {
+            _rightTriggerEffectMode = (byte)BinaryPrimitives.ReadUInt32LittleEndian(parameter[64..]);
+        }
+
         HostPlatform.Current.Input.SetTriggerRumble(
             (triggerMask & 0x01) != 0 ? DecodeTriggerVibration(parameter[8..64]) : null,
             (triggerMask & 0x02) != 0 ? DecodeTriggerVibration(parameter[64..120]) : null);
         return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    // Ghostrunner 2 polls this import after every scePadSetTriggerEffect and
+    // retries forever while it returns an error, parking the whole title in a
+    // gettimeofday spin. Report one mode byte per trigger, echoing the last
+    // applied effect so the guest sees its command as taken effect.
+    [SysAbiExport(
+        Nid = "znaWI0gpuo8",
+        ExportName = "scePadGetTriggerEffectState",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadGetTriggerEffectState(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (!IsPrimaryPadHandle(handle))
+        {
+            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
+        }
+
+        if (stateAddress == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> state = [_leftTriggerEffectMode, _rightTriggerEffectMode];
+        return ctx.Memory.TryWrite(stateAddress, state)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
     private static byte DecodeTriggerVibration(ReadOnlySpan<byte> command)
