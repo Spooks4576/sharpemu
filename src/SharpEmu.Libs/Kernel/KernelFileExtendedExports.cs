@@ -619,6 +619,13 @@ public static partial class KernelMemoryCompatExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
     public static int KernelAioPollRequests(CpuContext ctx) => KernelAioComplete(ctx);
 
+    [SysAbiExport(Nid = "KOF-oJbQVvc", ExportName = "sceKernelAioWaitRequest",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+    public static int KernelAioWaitRequest(CpuContext ctx)
+    {
+       return KernelAioComplete(ctx);
+    }
+
     [SysAbiExport(Nid = "lgK+oIWkJyA", ExportName = "sceKernelAioWaitRequests",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
     public static int KernelAioWaitRequests(CpuContext ctx) => KernelAioComplete(ctx);

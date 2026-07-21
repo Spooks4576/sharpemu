@@ -736,6 +736,58 @@ public static partial class AgcExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // Gen5::GraphicsUnknownGetFusedShaderSize — reports the byte size of a shader
+    // fused from two halves (rdi=out size_t, rsi/rdx=half A/B); the caller allocas
+    // that many bytes and fills them with FuseShaderHalves. The GCN merged-stage
+    // fusion format is not modelled, so report 0: the caller then allocates
+    // nothing and the source halves are used directly, matching the behaviour
+    // before this import was resolved — but without the unresolved-import trap.
+    // Names are the reference's internal symbols; the real sceAgc export names
+    // are unknown, so the NID (what titles import) is authoritative here.
+    #pragma warning disable SHEM004, SHEM006
+    [SysAbiExport(
+        Nid = "dolOmWH+huQ",
+        ExportName = "sceAgcGetFusedShaderSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GraphicsGetFusedShaderSize(CpuContext ctx)
+    {
+        var sizeOut = ctx[CpuRegister.Rdi];
+        var halfA = ctx[CpuRegister.Rsi];
+        var halfB = ctx[CpuRegister.Rdx];
+        if (sizeOut == 0 || halfA == 0 || halfB == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        TryWriteUInt32(ctx, sizeOut, 0);
+        TryWriteUInt32(ctx, sizeOut + sizeof(uint), 0);
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    // Gen5::GraphicsUnknownFuseShaderHalves — writes the fused shader into the
+    // caller's buffer (rdi=out, rsi/rdx=half A/B). With the fusion format not yet
+    // modelled and GetFusedShaderSize reporting 0, there is nothing to write;
+    // return OK so the caller's wrapper treats it as success.
+    [SysAbiExport(
+        Nid = "fd5Bp5tGTgo",
+        ExportName = "sceAgcFuseShaderHalves",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GraphicsFuseShaderHalves(CpuContext ctx)
+    {
+        var output = ctx[CpuRegister.Rdi];
+        var halfA = ctx[CpuRegister.Rsi];
+        var halfB = ctx[CpuRegister.Rdx];
+        if (output == 0 || halfA == 0 || halfB == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+    #pragma warning restore SHEM004, SHEM006
+
     [SysAbiExport(
         Nid = "vcmNN+AAXnY",
         ExportName = "sceAgcSetCxRegIndirectPatchSetAddress",

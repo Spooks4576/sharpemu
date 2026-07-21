@@ -40,6 +40,11 @@ public static class FmodPlatformExports
             ? value
             : 0;
 
+    // Every export below is a synthetic label for an uncatalogued NID recovered
+    // from libfmod.prx (the Unknown* convention); the NID is authoritative, so
+    // SHEM006 (name not in ps5_names.txt) does not apply.
+    #pragma warning disable SHEM006
+
     // System::setThreadAttributes(threadType, affinity, priority, stackKiB).
     [SysAbiExport(Nid = "tPFAXasYRR4", ExportName = "sharpemu_fmod_system_set_thread_attributes", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libfmod")]
     public static int FmodSystemSetThreadAttributes(CpuContext ctx)
@@ -176,4 +181,5 @@ public static class FmodPlatformExports
 
     [SysAbiExport(Nid = "iILsKSo5Syg", ExportName = "sharpemu_fmod_platform_unresolved_3", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libfmod")]
     public static int FmodPlatformUnresolved3(CpuContext ctx) => Done(ctx, "[unresolved iILsKSo5Syg]", FmodOk);
+    #pragma warning restore SHEM006
 }

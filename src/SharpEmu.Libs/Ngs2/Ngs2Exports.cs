@@ -496,6 +496,10 @@ public static class Ngs2Exports
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        // Hoisted out of the loop (CA2014): one reusable scratch span for the
+        // optional per-buffer trace dump, fully overwritten by TryRead before use.
+        Span<byte> traceInfo = stackalloc byte[RenderBufferInfoSize];
+
         for (uint i = 0; i < bufferInfoCount; i++)
         {
             var entryAddress = bufferInfoAddress + (i * RenderBufferInfoSize);
@@ -527,10 +531,9 @@ public static class Ngs2Exports
 
                 if (ShouldTrace() && Interlocked.Increment(ref _renderInfoDumps) <= 4)
                 {
-                    Span<byte> rbi = stackalloc byte[RenderBufferInfoSize];
-                    ctx.Memory.TryRead(entryAddress, rbi);
+                    ctx.Memory.TryRead(entryAddress, traceInfo);
                     Console.Error.WriteLine(
-                        $"[LOADER][TRACE] ngs2.renderbufinfo addr=0x{bufferAddress:X} size={bufferSize} ch={channels} raw={Convert.ToHexString(rbi)}");
+                        $"[LOADER][TRACE] ngs2.renderbufinfo addr=0x{bufferAddress:X} size={bufferSize} ch={channels} raw={Convert.ToHexString(traceInfo)}");
                 }
             }
         }

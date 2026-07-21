@@ -517,6 +517,7 @@ public static class KernelPthreadCompatExports
         LibraryName = "libKernel")]
     public static int PosixPthreadCondTimedwait(CpuContext ctx)
     {
+        MaybeTraceCondWaitBacktrace(ctx, ctx[CpuRegister.Rdi]);
         var deadlineAddress = ctx[CpuRegister.Rdx];
         if (deadlineAddress == 0 ||
             !KernelMemoryCompatExports.TryReadUInt64Compat(ctx, deadlineAddress, out var rawSeconds) ||
@@ -1634,6 +1635,14 @@ public static class KernelPthreadCompatExports
         if (condAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        // Diagnostic: FPThreadEvent::Trigger signals the event's cond (event+0x28),
+        // so SHARPEMU_TRACE_COND_SIGNAL=1 logs which events actually get triggered
+        // — cross-reference against a cond a thread is stuck waiting on.
+        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_COND_SIGNAL"), "1", StringComparison.Ordinal))
+        {
+            Console.Error.WriteLine($"[LOADER][COND-SIG] cond=0x{condAddress:X} event=0x{condAddress - 0x28:X} broadcast={broadcast}");
         }
 
         if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out _, out var state))
