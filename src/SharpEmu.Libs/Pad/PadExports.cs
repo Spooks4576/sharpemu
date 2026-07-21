@@ -374,9 +374,16 @@ public static class PadExports
             _rightTriggerEffectMode = (byte)BinaryPrimitives.ReadUInt32LittleEndian(parameter[64..]);
         }
 
-        HostPlatform.Current.Input.SetTriggerRumble(
-            (triggerMask & 0x01) != 0 ? DecodeTriggerVibration(parameter[8..64]) : null,
-            (triggerMask & 0x02) != 0 ? DecodeTriggerVibration(parameter[64..120]) : null);
+        // The mode state above is the export's data contract; delivering the
+        // physical trigger rumble is a best-effort host side effect. Skip it when
+        // no host backend exists (e.g. arm64 test hosts) rather than faulting.
+        if (HostPlatform.IsSupported)
+        {
+            HostPlatform.Current.Input.SetTriggerRumble(
+                (triggerMask & 0x01) != 0 ? DecodeTriggerVibration(parameter[8..64]) : null,
+                (triggerMask & 0x02) != 0 ? DecodeTriggerVibration(parameter[64..120]) : null);
+        }
+
         return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_OK);
     }
 

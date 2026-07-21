@@ -19,6 +19,17 @@ public static class HostPlatform
 
     public static IHostPlatform Current => Instance.Value;
 
+    /// <summary>
+    /// Whether <see cref="Current"/> can be resolved without throwing — i.e. this
+    /// is an x86-64 process on a supported OS. Lets static exports skip host-only
+    /// side effects (e.g. controller rumble) on unsupported hosts, such as the
+    /// arm64 CI runners, instead of faulting. Mirrors the conditions in
+    /// <see cref="Create"/>.
+    /// </summary>
+    public static bool IsSupported =>
+        RuntimeInformation.ProcessArchitecture == Architecture.X64 &&
+        (OperatingSystem.IsWindows() || OperatingSystem.IsLinux() || OperatingSystem.IsMacOS());
+
     private static IHostPlatform Create()
     {
         // The Windows backend executes guest x86-64 natively and emits x86-64
