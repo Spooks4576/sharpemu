@@ -6,6 +6,7 @@ using Silk.NET.Core.Native;
 using Silk.NET.Maths;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
+using SharpEmu.Libs.AvPlayer;
 using SharpEmu.Libs.Bink;
 using Silk.NET.Input;
 using SharpEmu.Libs.Gpu;
@@ -1106,6 +1107,7 @@ internal static unsafe class VulkanVideoPresenter
                 Blends = broadcastBlends,
             };
         }
+
         lock (_gate)
         {
             if (_closed)
@@ -2230,7 +2232,7 @@ internal static unsafe class VulkanVideoPresenter
                 if (IsGuestWorkCompletedLocked(pending.RequiredGuestWorkSequence))
                 {
                     presentation = _pendingGuestImagePresentations.Dequeue();
-                    TryReplaceWithBinkFrame(ref presentation);
+                    TryReplaceWithHostMovieFrame(ref presentation);
                     return true;
                 }
 
@@ -2263,13 +2265,27 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             presentation = latest;
-            TryReplaceWithBinkFrame(ref presentation);
+            TryReplaceWithHostMovieFrame(ref presentation);
             return true;
         }
     }
 
-    private static void TryReplaceWithBinkFrame(ref Presentation presentation)
+    private static void TryReplaceWithHostMovieFrame(ref Presentation presentation)
     {
+        if (AvPlayerMovieBridge.TryGetFrame(out var avPixels, out var avWidth, out var avHeight))
+        {
+            presentation = new Presentation(
+                avPixels,
+                avWidth,
+                avHeight,
+                presentation.Sequence,
+                GuestDrawKind.None,
+                TranslatedDraw: null,
+                presentation.RequiredGuestWorkSequence,
+                IsSplash: false);
+            return;
+        }
+
         if (!Bink2MovieBridge.TryDecodeNextFrame(out var pixels, out var width, out var height))
         {
             return;

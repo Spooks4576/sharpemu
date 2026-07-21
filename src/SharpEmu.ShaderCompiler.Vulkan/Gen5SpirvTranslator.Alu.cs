@@ -903,6 +903,19 @@ public static partial class Gen5SpirvTranslator
                         width);
                     break;
                 }
+                case "VBfeI32":
+                {
+                    var width = BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
+                    result = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.BitFieldSExtract,
+                            _intType,
+                            Bitcast(_intType, GetRawSource(instruction, 0)),
+                            BitwiseAnd(GetRawSource(instruction, 1), UInt(31)),
+                            width));
+                    break;
+                }
                 case "VBfiB32":
                 {
                     var mask = GetRawSource(instruction, 0);
@@ -1571,8 +1584,14 @@ public static partial class Gen5SpirvTranslator
             }
             else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32"))
             {
-                var left = GetRawSource(instruction, 0);
-                var right = GetRawSource(instruction, 1);
+                var is64Bit = opcode.EndsWith("U64", StringComparison.Ordinal) ||
+                              opcode.EndsWith("I64", StringComparison.Ordinal);
+                var left = is64Bit
+                    ? GetRawSource64(instruction, 0)
+                    : GetRawSource(instruction, 0);
+                var right = is64Bit
+                    ? GetRawSource64(instruction, 1)
+                    : GetRawSource(instruction, 1);
                 var signed = opcode.EndsWith("I32", StringComparison.Ordinal);
                 if (signed)
                 {
@@ -1590,7 +1609,7 @@ public static partial class Gen5SpirvTranslator
                     "VCmpLeI32" or "VCmpxLeI32" => SpirvOp.SLessThanEqual,
                     "VCmpGtI32" or "VCmpxGtI32" => SpirvOp.SGreaterThan,
                     "VCmpGeI32" or "VCmpxGeI32" => SpirvOp.SGreaterThanEqual,
-                    "VCmpLtU32" or "VCmpxLtU32" => SpirvOp.ULessThan,
+                    "VCmpLtU32" or "VCmpxLtU32" or "VCmpLtU64" => SpirvOp.ULessThan,
                     "VCmpLeU32" or "VCmpxLeU32" => SpirvOp.ULessThanEqual,
                     "VCmpGtU32" or "VCmpxGtU32" => SpirvOp.UGreaterThan,
                     "VCmpGeU32" or "VCmpxGeU32" => SpirvOp.UGreaterThanEqual,

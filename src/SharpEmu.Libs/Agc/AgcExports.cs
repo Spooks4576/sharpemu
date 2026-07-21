@@ -1291,6 +1291,22 @@ public static partial class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "bxGoVxpdSPQ",
+        ExportName = "sceAgcCbSetShRegisterRangeDirectGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int CbSetShRegisterRangeDirectGetSize(CpuContext ctx)
+    {
+        // The SysV ABI places this function's sole argument in RDI. The direct
+        // emitter reserves a two-DWORD marker followed by a SET_SH_REG packet
+        // containing its header, register offset, and one DWORD per value.
+        var valueCount = (uint)ctx[CpuRegister.Rdi];
+        var size = unchecked((valueCount + 4u) * sizeof(uint));
+        ctx[CpuRegister.Rax] = size;
+        return unchecked((int)size);
+    }
+
+    [SysAbiExport(
         Nid = "wr23dPKyWc0",
         ExportName = "sceAgcCbReleaseMem",
         Target = Generation.Gen5,

@@ -238,7 +238,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var alignedSize = (size + 0xFFF) & ~0xFFFUL;
         var protection = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
         var hostProtection = executable ? HostPageProtection.ReadWriteExecute : HostPageProtection.ReadWrite;
-        var result = _hostMemory.Allocate(desiredAddress, alignedSize, hostProtection);
+        var reservedOnly = ShouldReserveOnly(alignedSize, executable);
+        var result = reservedOnly
+            ? _hostMemory.Reserve(desiredAddress, alignedSize, hostProtection)
+            : _hostMemory.Allocate(desiredAddress, alignedSize, hostProtection);
         if (result == 0)
         {
             return false;
@@ -260,7 +263,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 VirtualAddress = actualAddress,
                 Size = alignedSize,
                 IsExecutable = executable,
-                IsReservedOnly = false,
+                IsReservedOnly = reservedOnly,
                 Protection = protection
             });
         }
@@ -269,10 +272,17 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             _gate.ExitWriteLock();
         }
 
-        var allocationKind = executable ? "executable memory" : "data memory";
+        var allocationKind = executable
+            ? "executable memory"
+            : reservedOnly ? "data address space (lazy commit)" : "data memory";
         TraceVmem($"Allocated exact {allocationKind}: 0x{actualAddress:X16} - 0x{actualAddress + alignedSize:X16} ({alignedSize} bytes)");
         return true;
     }
+
+    private static bool ShouldReserveOnly(ulong alignedSize, bool executable) =>
+        !executable &&
+        alignedSize >= LargeDataReserveThreshold &&
+        alignedSize > FullCommitRegionLimit;
 
     public string DescribeAddressForDiagnostics(ulong address)
     {
@@ -302,9 +312,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var protection = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
         var hostProtection = executable ? HostPageProtection.ReadWriteExecute : HostPageProtection.ReadWrite;
         var reservedOnly = false;
-        var preferReserveOnly = !executable &&
-            alignedSize >= LargeDataReserveThreshold &&
-            alignedSize > FullCommitRegionLimit;
+        var preferReserveOnly = ShouldReserveOnly(alignedSize, executable);
 
         ulong result = 0;
         if (preferReserveOnly)

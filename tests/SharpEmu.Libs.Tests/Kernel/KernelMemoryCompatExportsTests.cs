@@ -302,6 +302,111 @@ public sealed class KernelMemoryCompatExportsTests
     }
 
     [Fact]
+    public void AllocateMainDirectMemory_WhenPhysicalRangeIsFullReturnsTryAgain()
+    {
+        const ulong directMemorySize = 13_824UL * 1024 * 1024;
+        var context = new CpuContext(new FakeCpuMemory(GuestMemoryBase, 0x1000), Generation.Gen5);
+
+        try
+        {
+            AllocateDirectMemory(context, 0, directMemorySize);
+
+            context[CpuRegister.Rdi] = 0x4000;
+            context[CpuRegister.Rsi] = 0x4000;
+            context[CpuRegister.Rdx] = 0;
+            context[CpuRegister.Rcx] = AllocationOutAddress;
+
+            var result = KernelMemoryCompatExports.KernelAllocateMainDirectMemory(context);
+
+            Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN, result);
+        }
+        finally
+        {
+            ReleaseDirectMemory(context, 0, directMemorySize);
+        }
+    }
+
+    [Fact]
+    public void GetDirectMemorySize_ReturnsPs5ApplicationMemoryLimit()
+    {
+        const ulong expectedSize = 13_824UL * 1024 * 1024;
+        var context = new CpuContext(new FakeCpuMemory(GuestMemoryBase, 0x1000), Generation.Gen5);
+
+        Assert.Equal(0, KernelMemoryCompatExports.KernelGetDirectMemorySize(context));
+        Assert.Equal(expectedSize, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void VirtualQuery_CommitInsideReservationPreservesUncommittedRemainder()
+    {
+        const ulong memoryBase = 0x5_1000_0000;
+        const ulong inOutAddress = memoryBase + 0x100;
+        const ulong infoAddress = memoryBase + 0x200;
+        const ulong reservationAddress = memoryBase + 0x4000;
+        const ulong reservationLength = 0x4000;
+        const ulong committedLength = 0x1000;
+        const int committedFlagOffset = 32;
+        var memory = new FakeCpuMemory(memoryBase, 0x10_000);
+        var context = new CpuContext(memory, Generation.Gen5);
+
+        KernelMemoryCompatExports.RegisterReservedVirtualRange(
+            reservationAddress,
+            reservationLength);
+
+        try
+        {
+            Assert.True(context.TryWriteUInt64(inOutAddress, reservationAddress));
+            context[CpuRegister.Rdi] = inOutAddress;
+            context[CpuRegister.Rsi] = committedLength;
+            context[CpuRegister.Rdx] = 0x03; // CPU read/write
+            context[CpuRegister.Rcx] = 0x10; // fixed
+            context[CpuRegister.R8] = 0;
+            context[CpuRegister.R9] = 0;
+            Assert.Equal(0, KernelMemoryCompatExports.KernelMapDirectMemory(context));
+
+            AssertVirtualQueryCommitted(
+                context,
+                memory,
+                reservationAddress,
+                infoAddress,
+                committedFlagOffset,
+                expected: true);
+            AssertVirtualQueryCommitted(
+                context,
+                memory,
+                reservationAddress + committedLength,
+                infoAddress,
+                committedFlagOffset,
+                expected: false);
+        }
+        finally
+        {
+            context[CpuRegister.Rdi] = reservationAddress;
+            context[CpuRegister.Rsi] = reservationLength;
+            _ = KernelMemoryCompatExports.KernelMunmap(context);
+        }
+    }
+
+    private static void AssertVirtualQueryCommitted(
+        CpuContext context,
+        FakeCpuMemory memory,
+        ulong queryAddress,
+        ulong infoAddress,
+        int committedFlagOffset,
+        bool expected)
+    {
+        context[CpuRegister.Rdi] = queryAddress;
+        context[CpuRegister.Rsi] = 0;
+        context[CpuRegister.Rdx] = infoAddress;
+        context[CpuRegister.Rcx] = 72;
+        Assert.Equal(0, KernelMemoryCompatExports.KernelVirtualQuery(context));
+
+        Span<byte> stateFlags = stackalloc byte[1];
+        Assert.True(memory.TryRead(infoAddress + (ulong)committedFlagOffset, stateFlags));
+        Assert.Equal(expected, (stateFlags[0] & 0x10) != 0);
+    }
+
+    [Fact]
     public void Mprotect_ZeroAddressReturnsInvalidArgument()
     {
         var memory = new FakeCpuMemory(0x1_0000_0000, 0x1000);

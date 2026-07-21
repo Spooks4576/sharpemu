@@ -50,8 +50,10 @@ public static partial class KernelMemoryCompatExports
     private const int SeekSet = 0;
     private const int SeekCur = 1;
     private const int SeekEnd = 2;
-    private const ulong DirectMemorySizeBytes = 16384UL * 1024 * 1024;
-    private const ulong UnsetMainDirectMemoryPoolBase = ulong.MaxValue;
+    // PS5 exposes 13.5 GiB of main direct memory to applications. This is the
+    // physical address-space limit returned by sceKernelGetDirectMemorySize,
+    // not the console's total installed RAM.
+    private const ulong DirectMemorySizeBytes = 13824UL * 1024 * 1024;
     private const ulong FlexibleMemorySizeBytes = 448UL * 1024 * 1024;
     private const int OrbisVirtualQueryInfoSize = 72;
     private const int OrbisKernelMaximumNameLength = 32;
@@ -144,7 +146,6 @@ public static partial class KernelMemoryCompatExports
     // well clear of host mappings instead.
     private static readonly ulong DefaultMapSearchBase =
         OperatingSystem.IsWindows() ? 0x1_0000_0000UL : 0x20_0000_0000UL;
-    private static ulong _mainDirectMemoryPoolBase = UnsetMainDirectMemoryPoolBase;
     private static ulong _allocatedFlexibleBytes;
     private static ulong _threadAtexitCountCallback;
     private static ulong _threadAtexitReportCallback;
@@ -198,7 +199,14 @@ public static partial class KernelMemoryCompatExports
 
     private readonly record struct DirectAllocation(ulong Start, ulong Length, int MemoryType);
     private readonly record struct LibcHeapAllocation(nint BaseAddress, nuint Size, nuint Alignment);
-    private readonly record struct MappedRegion(ulong Address, ulong Length, int Protection, bool IsFlexible, bool IsDirect, ulong DirectStart);
+    private readonly record struct MappedRegion(
+        ulong Address,
+        ulong Length,
+        int Protection,
+        bool IsFlexible,
+        bool IsDirect,
+        bool IsCommitted,
+        ulong DirectStart);
     private readonly record struct BatchMapEntry(ulong Start, ulong Offset, ulong Length, byte Protection, byte Type, int Operation);
 
     public static void RegisterGuestPathMount(string guestMountPoint, string hostRoot)
@@ -274,6 +282,7 @@ public static partial class KernelMemoryCompatExports
                 OrbisProtCpuReadWrite,
                 IsFlexible: false,
                 IsDirect: false,
+                IsCommitted: true,
                 DirectStart: 0);
         }
 
@@ -306,6 +315,7 @@ public static partial class KernelMemoryCompatExports
                 Protection: 0,
                 IsFlexible: false,
                 IsDirect: false,
+                IsCommitted: false,
                 DirectStart: 0);
         }
     }
@@ -2795,42 +2805,29 @@ public static partial class KernelMemoryCompatExports
         ulong aligned;
         lock (_memoryGate)
         {
-            var allocationLimit = DirectMemorySizeBytes;
-            if (_mainDirectMemoryPoolBase != UnsetMainDirectMemoryPoolBase &&
-                !TryAddU64(_mainDirectMemoryPoolBase, DirectMemorySizeBytes, out allocationLimit))
+            // Main direct memory is not a separate or expandable pool. Like
+            // sceKernelAllocateDirectMemory, it allocates a physical offset
+            // inside the single range reported by sceKernelGetDirectMemorySize.
+            // Returning offsets beyond that range makes the guest treat an
+            // invalid physical address as allocator metadata.
+            if (!TryAllocateDirectMemoryLocked(
+                    0,
+                    DirectMemorySizeBytes,
+                    length,
+                    effectiveAlignment,
+                    memoryType,
+                    DirectMemorySizeBytes,
+                    out aligned))
             {
-                allocationLimit = ulong.MaxValue;
-            }
-
-            if (!TryAllocateDirectMemoryLocked(0, allocationLimit, length, effectiveAlignment, memoryType, allocationLimit, out aligned))
-            {
-                var poolBase = _mainDirectMemoryPoolBase == UnsetMainDirectMemoryPoolBase
-                    ? AlignUp(GetDirectMemoryHighWaterMarkLocked(), effectiveAlignment)
-                    : _mainDirectMemoryPoolBase;
-
-                if (_mainDirectMemoryPoolBase == UnsetMainDirectMemoryPoolBase &&
-                    TryAddU64(poolBase, DirectMemorySizeBytes, out var shiftedLimit) &&
-                    TryAllocateDirectMemoryLocked(0, shiftedLimit, length, effectiveAlignment, memoryType, shiftedLimit, out aligned))
-                {
-                    _mainDirectMemoryPoolBase = poolBase;
-                    if (ShouldTraceDirectMemory())
-                    {
-                        Console.Error.WriteLine(
-                            $"[LOADER][TRACE] main_direct_pool: base=0x{poolBase:X16} limit=0x{shiftedLimit:X16}");
-                    }
-                }
-                else
-                {
-                    TraceDirectMemoryCall(
-                        ctx,
-                        "allocate_main_direct",
-                        length,
-                        effectiveAlignment,
-                        memoryType,
-                        outAddress,
-                        result: OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
-                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN;
-                }
+                TraceDirectMemoryCall(
+                    ctx,
+                    "allocate_main_direct",
+                    length,
+                    effectiveAlignment,
+                    memoryType,
+                    outAddress,
+                    result: OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN;
             }
         }
 
@@ -3071,13 +3068,14 @@ public static partial class KernelMemoryCompatExports
             }
 
             _nextVirtualAddress = Math.Max(_nextVirtualAddress, mappedAddress + length);
-            _mappedRegions[mappedAddress] = new MappedRegion(
+            ReplaceMappedRegionRangeLocked(new MappedRegion(
                 mappedAddress,
                 length,
                 protection,
                 IsFlexible: false,
                 IsDirect: true,
-                DirectStart: directMemoryStart);
+                IsCommitted: true,
+                DirectStart: directMemoryStart));
         }
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
@@ -3163,13 +3161,14 @@ public static partial class KernelMemoryCompatExports
 
             _nextVirtualAddress = Math.Max(_nextVirtualAddress, mappedAddress + length);
             _allocatedFlexibleBytes = Math.Min(FlexibleMemorySizeBytes, _allocatedFlexibleBytes + length);
-            _mappedRegions[mappedAddress] = new MappedRegion(
+            ReplaceMappedRegionRangeLocked(new MappedRegion(
                 mappedAddress,
                 length,
                 protection,
                 IsFlexible: true,
                 IsDirect: false,
-                DirectStart: 0);
+                IsCommitted: true,
+                DirectStart: 0));
         }
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
@@ -3382,7 +3381,10 @@ public static partial class KernelMemoryCompatExports
             stateFlags |= 0x02u;
         }
 
-        stateFlags |= 0x10u;
+        if (region.IsCommitted)
+        {
+            stateFlags |= 0x10u;
+        }
 
         BinaryPrimitives.WriteUInt64LittleEndian(payload[0..8], region.Address);
         BinaryPrimitives.WriteUInt64LittleEndian(payload[8..16], regionEnd);

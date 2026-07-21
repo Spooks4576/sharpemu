@@ -634,7 +634,7 @@ public sealed partial class DirectExecutionBackend
 		try
 		{
 			ulong frame = rbp;
-			for (int i = 0; i < 3; i++)
+			for (int i = 0; i < 8; i++)
 			{
 				if (frame < 0x10000)
 				{
@@ -644,6 +644,7 @@ public sealed partial class DirectExecutionBackend
 				ulong ret = (ulong)Marshal.ReadInt64((nint)(frame + 8));
 				if (ret >= 0x40)
 				{
+					ProbeReturnRip(ret, -1 - i);
 					DumpGuestInstructionStream($"frame#{i}-ret-prelude", ret - 0x40, 24);
 				}
 

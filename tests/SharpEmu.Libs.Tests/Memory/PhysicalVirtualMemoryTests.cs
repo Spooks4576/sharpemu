@@ -14,6 +14,26 @@ namespace SharpEmu.Libs.Tests.Memory;
 // These tests pin that behaviour through fake IHostMemory implementations.
 public sealed class PhysicalVirtualMemoryTests
 {
+    [Fact]
+    public void ExactSearchReservesLargeDataRangeWithoutCommittingHostRam()
+    {
+        using var host = new LazyZeroedHostMemory();
+        using var memory = new PhysicalVirtualMemory(host);
+
+        var size = (4UL << 30) + 0x1000;
+        Assert.True(memory.TryAllocateAtOrAbove(
+            host.Address,
+            size,
+            executable: false,
+            alignment: 0x1000,
+            out var address));
+
+        Assert.Equal(host.Address, address);
+        Assert.Equal(0, host.AllocateCalls);
+        Assert.Equal(1, host.ReserveCalls);
+        Assert.Empty(host.CommitCalls);
+    }
+
     // 1. Lazy commit: a reserve-only region has its pages committed on demand
     //    when read; freshly committed pages read as zero.
     [Fact]
@@ -185,11 +205,25 @@ public sealed class PhysicalVirtualMemoryTests
 
         public List<(ulong Address, ulong Size, HostPageProtection Protection)> CommitCalls { get; } = [];
 
+        public ulong Address => _address;
+
+        public int AllocateCalls { get; private set; }
+
+        public int ReserveCalls { get; private set; }
+
         public int QueryCalls { get; private set; }
 
-        public ulong Allocate(ulong desiredAddress, ulong size, HostPageProtection protection) => _address;
+        public ulong Allocate(ulong desiredAddress, ulong size, HostPageProtection protection)
+        {
+            AllocateCalls++;
+            return _address;
+        }
 
-        public ulong Reserve(ulong desiredAddress, ulong size, HostPageProtection protection) => _address;
+        public ulong Reserve(ulong desiredAddress, ulong size, HostPageProtection protection)
+        {
+            ReserveCalls++;
+            return _address;
+        }
 
         public bool Commit(ulong address, ulong size, HostPageProtection protection)
         {

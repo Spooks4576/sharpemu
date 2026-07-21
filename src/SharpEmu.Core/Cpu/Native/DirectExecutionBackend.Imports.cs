@@ -213,6 +213,7 @@ public sealed partial class DirectExecutionBackend
 		if (probeTarget &&
 			Interlocked.Increment(ref _probeImportReturnAddressCount) <= 2048)
 		{
+			ProbeReturnRip(num7, num);
 			var frameValue = TryReadStackU64(value4, out var savedRbp) ? savedRbp : 0;
 			var frameReturn = TryReadStackU64(value4 + sizeof(ulong), out var savedReturn)
 				? savedReturn
@@ -222,6 +223,8 @@ public sealed partial class DirectExecutionBackend
 				$"thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
 				$"nid={importStubEntry.Nid} ret=0x{num7:X16} " +
 				$"rsp=0x{(ulong)argPackPtr + 96:X16} rbp=0x{value4:X16} " +
+				$"rbx=0x{value3:X16} r12=0x{value5:X16} r13=0x{value6:X16} " +
+				$"r14=0x{value7:X16} r15=0x{value8:X16} " +
 				$"saved_rbp=0x{frameValue:X16} saved_ret=0x{frameReturn:X16}");
 		}
 		var isGuestWorker = GuestThreadExecution.IsGuestThread;
@@ -541,7 +544,16 @@ public sealed partial class DirectExecutionBackend
 				orbisGen2Result == OrbisGen2Result.ORBIS_GEN2_OK &&
 				string.Equals(importStubEntry.Nid, "BohYr-F7-is", StringComparison.Ordinal))
 			{
-				RegisterPrtLazyCommitRange(value2, num3);
+				RegisterLazyCommitRange(value2, num3, "prt");
+			}
+			else if (dispatchResolved &&
+				orbisGen2Result == OrbisGen2Result.ORBIS_GEN2_OK &&
+				string.Equals(importStubEntry.Nid, "7oxv3PPCumo", StringComparison.Ordinal) &&
+				value != 0 &&
+				cpuContext.TryReadUInt64(value, out var reservedAddress) &&
+				reservedAddress != 0)
+			{
+				RegisterLazyCommitRange(reservedAddress, value2, "reserve");
 			}
 			if (!dispatchResolved)
 			{

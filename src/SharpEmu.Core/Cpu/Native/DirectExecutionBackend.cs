@@ -190,6 +190,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private nint _tlsHandlerAddress;
 
+	private readonly nint[] _tlsLoadHandlerAddresses = new nint[16];
+
 	private nint _tlsBaseAddress;
 
 	private nint _ownedTlsBaseAddress;
@@ -360,7 +362,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private readonly object _lazyCommitRangeGate = new object();
 
-	private readonly List<LazyCommitRange> _prtLazyCommitRanges = new List<LazyCommitRange>();
+	private readonly List<LazyCommitRange> _lazyCommitRanges = new List<LazyCommitRange>();
 
 	private ulong _returnFallbackTarget;
 
@@ -663,7 +665,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
-	private readonly record struct LazyCommitRange(ulong BaseAddress, ulong Size);
+	private readonly record struct LazyCommitRange(ulong BaseAddress, ulong Size, string Owner);
 
 	private readonly object _guestThreadGate = new object();
 
@@ -1156,7 +1158,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		lock (_lazyCommitRangeGate)
 		{
-			_prtLazyCommitRanges.Clear();
+			_lazyCommitRanges.Clear();
 		}
 		ClearGuestThreads();
 		_contextualUnresolvedReturnSites.Clear();
@@ -2280,59 +2282,105 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			throw new OutOfMemoryException("Failed to allocate TLS handler");
 		}
-		// The handler runs in place of a patched guest `mov reg, fs:[0]`,
-		// which preserves every register and the flags. TlsGetValue (and the
-		// Win64 ABI in general) clobbers rcx/rdx/r8-r11 and the arithmetic
-		// flags, so save them all: guest code legitimately keeps live values
-		// and comparison results across TLS reads, and losing them corrupted
-		// deterministic computations (e.g. procedural texture generation).
-		byte* tlsHandlerAddress = (byte*)_tlsHandlerAddress;
-		int num = 0;
-		tlsHandlerAddress[num++] = 0x9C;                    // pushfq
-		tlsHandlerAddress[num++] = 0x51;                    // push rcx
-		tlsHandlerAddress[num++] = 0x52;                    // push rdx
-		tlsHandlerAddress[num++] = 0x41;                    // push r8
-		tlsHandlerAddress[num++] = 0x50;
-		tlsHandlerAddress[num++] = 0x41;                    // push r9
-		tlsHandlerAddress[num++] = 0x51;
-		tlsHandlerAddress[num++] = 0x41;                    // push r10
-		tlsHandlerAddress[num++] = 0x52;
-		tlsHandlerAddress[num++] = 0x41;                    // push r11
-		tlsHandlerAddress[num++] = 0x53;
-		tlsHandlerAddress[num++] = 0x48;                    // sub rsp, 0x20
-		tlsHandlerAddress[num++] = 0x83;
-		tlsHandlerAddress[num++] = 0xEC;
-		tlsHandlerAddress[num++] = 0x20;
-		tlsHandlerAddress[num++] = 0xB9;                    // mov ecx, index
-		*(uint*)(tlsHandlerAddress + num) = _guestTlsBaseTlsIndex;
-		num += 4;
-		tlsHandlerAddress[num++] = 0x48;                    // mov rax, TlsGetValue
-		tlsHandlerAddress[num++] = 0xB8;
-		*(long*)(tlsHandlerAddress + num) = _tlsGetValueAddress;
-		num += 8;
-		tlsHandlerAddress[num++] = 0xFF;                    // call rax
-		tlsHandlerAddress[num++] = 0xD0;
-		tlsHandlerAddress[num++] = 0x48;                    // add rsp, 0x20
-		tlsHandlerAddress[num++] = 0x83;
-		tlsHandlerAddress[num++] = 0xC4;
-		tlsHandlerAddress[num++] = 0x20;
-		tlsHandlerAddress[num++] = 0x41;                    // pop r11
-		tlsHandlerAddress[num++] = 0x5B;
-		tlsHandlerAddress[num++] = 0x41;                    // pop r10
-		tlsHandlerAddress[num++] = 0x5A;
-		tlsHandlerAddress[num++] = 0x41;                    // pop r9
-		tlsHandlerAddress[num++] = 0x59;
-		tlsHandlerAddress[num++] = 0x41;                    // pop r8
-		tlsHandlerAddress[num++] = 0x58;
-		tlsHandlerAddress[num++] = 0x5A;                    // pop rdx
-		tlsHandlerAddress[num++] = 0x59;                    // pop rcx
-		tlsHandlerAddress[num++] = 0x9D;                    // popfq
-		tlsHandlerAddress[num++] = 0xC3;                    // ret
-		_tlsPatchStubOffset = (num + 15) & ~15;
+		// A guest `mov reg, fs:[0]` changes only its destination. A single handler
+		// that returns the TLS base in RAX silently corrupts a live guest RAX whenever
+		// the destination is another register. Emit one small handler per destination
+		// so TlsGetValue's volatile-register and flags clobbers are all hidden.
+		var handlerOffset = 0;
+		for (var destinationRegister = 0; destinationRegister < _tlsLoadHandlerAddresses.Length; destinationRegister++)
+		{
+			// Replacing a load into RSP with a call cannot preserve the call stack.
+			// It is not emitted by the supported compilers, so leave it unpatched.
+			if (destinationRegister == 4)
+			{
+				continue;
+			}
+
+			handlerOffset = (handlerOffset + 15) & ~15;
+			_tlsLoadHandlerAddresses[destinationRegister] = _tlsHandlerAddress + handlerOffset;
+			handlerOffset += EmitTlsLoadHandler(
+				(byte*)_tlsHandlerAddress + handlerOffset,
+				destinationRegister,
+				_guestTlsBaseTlsIndex,
+				(ulong)_tlsGetValueAddress);
+		}
+
+		// Keep the legacy address as the RAX handler. TLS immediate-store helpers
+		// call it and intentionally consume its RAX result.
+		_tlsHandlerAddress = _tlsLoadHandlerAddresses[0];
+		_tlsPatchStubOffset = (handlerOffset + 15) & ~15;
 		uint num2 = default(uint);
 		VirtualProtect((void*)_tlsHandlerAddress, TlsHandlerRegionSize, 32u, &num2);
 		FlushInstructionCache(GetCurrentProcess(), (void*)_tlsHandlerAddress, TlsHandlerRegionSize);
 		Console.Error.WriteLine($"[LOADER][INFO] TLS handler at 0x{_tlsHandlerAddress:X16}");
+	}
+
+	internal static unsafe int EmitTlsLoadHandler(
+		byte* code,
+		int destinationRegister,
+		uint tlsIndex,
+		ulong tlsGetValueAddress)
+	{
+		ReadOnlySpan<int> volatileRegisters = [0, 1, 2, 8, 9, 10, 11];
+		var offset = 0;
+		code[offset++] = 0x9C; // pushfq
+		foreach (var register in volatileRegisters)
+		{
+			if (register != destinationRegister)
+			{
+				EmitPushRegister(code, ref offset, register);
+			}
+		}
+
+		var destinationIsVolatile = volatileRegisters.Contains(destinationRegister);
+		var shadowSpace = destinationIsVolatile ? (byte)0x20 : (byte)0x28;
+		code[offset++] = 0x48; code[offset++] = 0x83; code[offset++] = 0xEC; code[offset++] = shadowSpace;
+		code[offset++] = 0xB9; // mov ecx, tlsIndex
+		*(uint*)(code + offset) = tlsIndex;
+		offset += sizeof(uint);
+		code[offset++] = 0x48; code[offset++] = 0xB8; // mov rax, TlsGetValue
+		*(ulong*)(code + offset) = tlsGetValueAddress;
+		offset += sizeof(ulong);
+		code[offset++] = 0xFF; code[offset++] = 0xD0; // call rax
+		code[offset++] = 0x48; code[offset++] = 0x83; code[offset++] = 0xC4; code[offset++] = shadowSpace;
+
+		if (destinationRegister != 0)
+		{
+			code[offset++] = (byte)(0x48 | (destinationRegister >= 8 ? 1 : 0));
+			code[offset++] = 0x89;
+			code[offset++] = (byte)(0xC0 | (destinationRegister & 7)); // mov destination, rax
+		}
+
+		for (var index = volatileRegisters.Length - 1; index >= 0; index--)
+		{
+			var register = volatileRegisters[index];
+			if (register != destinationRegister)
+			{
+				EmitPopRegister(code, ref offset, register);
+			}
+		}
+
+		code[offset++] = 0x9D; // popfq
+		code[offset++] = 0xC3; // ret
+		return offset;
+	}
+
+	private static unsafe void EmitPushRegister(byte* code, ref int offset, int register)
+	{
+		if (register >= 8)
+		{
+			code[offset++] = 0x41;
+		}
+		code[offset++] = (byte)(0x50 + (register & 7));
+	}
+
+	private static unsafe void EmitPopRegister(byte* code, ref int offset, int register)
+	{
+		if (register >= 8)
+		{
+			code[offset++] = 0x41;
+		}
+		code[offset++] = (byte)(0x58 + (register & 7));
 	}
 
 	private unsafe static nint CreateUnresolvedReturnStub()
@@ -2790,7 +2838,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		try
 		{
 			*(sbyte*)address = -24;
-			long num = _tlsHandlerAddress;
+			long num = _tlsLoadHandlerAddresses[destinationRegister];
+			if (num == 0)
+			{
+				return false;
+			}
 			long num2 = address + 5;
 			long num3 = num - num2;
 			if (num3 < int.MinValue || num3 > int.MaxValue)
@@ -2801,12 +2853,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 			*(int*)(address + 1) = (int)num3;
 			var offset = 5;
-			if (destinationRegister != 0)
-			{
-				*(byte*)(address + offset++) = (byte)(0x48 | (destinationRegister >= 8 ? 1 : 0));
-				*(byte*)(address + offset++) = 0x89;
-				*(byte*)(address + offset++) = (byte)(0xC0 | (destinationRegister & 7));
-			}
 
 			while (offset < instructionLength)
 			{
@@ -2986,7 +3032,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
-	private void RegisterPrtLazyCommitRange(ulong baseAddress, ulong size)
+	private void RegisterLazyCommitRange(ulong baseAddress, ulong size, string owner)
 	{
 		if (size == 0)
 		{
@@ -2996,16 +3042,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		bool added = false;
 		lock (_lazyCommitRangeGate)
 		{
-			if (!_prtLazyCommitRanges.Any(range => range.BaseAddress == baseAddress && range.Size == size))
+			if (!_lazyCommitRanges.Any(range => range.BaseAddress == baseAddress && range.Size == size))
 			{
-				_prtLazyCommitRanges.Add(new LazyCommitRange(baseAddress, size));
+				_lazyCommitRanges.Add(new LazyCommitRange(baseAddress, size, owner));
 				added = true;
 			}
 		}
 
 		if (added)
 		{
-			Console.Error.WriteLine($"[LOADER][TRACE] registered PRT lazy range: base=0x{baseAddress:X16} size=0x{size:X16}");
+			Console.Error.WriteLine($"[LOADER][TRACE] registered {owner} lazy range: base=0x{baseAddress:X16} size=0x{size:X16}");
 		}
 	}
 
@@ -3026,11 +3072,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		lock (_lazyCommitRangeGate)
 		{
-			foreach (var range in _prtLazyCommitRanges)
+			foreach (var range in _lazyCommitRanges)
 			{
 				if (ContainsAddress(range.BaseAddress, range.Size, address))
 				{
-					owner = $"prt:0x{range.BaseAddress:X16}+0x{range.Size:X}";
+					owner = $"{range.Owner}:0x{range.BaseAddress:X16}+0x{range.Size:X}";
 					return true;
 				}
 			}
@@ -4536,15 +4582,32 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static bool TryGetVirtualMemory(CpuContext context, out IVirtualMemory virtualMemory)
 	{
-		if (context.Memory is IVirtualMemory directMemory)
+		return TryGetVirtualMemory(context.Memory, out virtualMemory);
+	}
+
+	internal static bool TryGetVirtualMemory(ICpuMemory rootMemory, out IVirtualMemory virtualMemory)
+	{
+		var target = rootMemory;
+		for (var depth = 0; depth < 4; depth++)
 		{
-			virtualMemory = directMemory;
-			return true;
-		}
-		if (context.Memory is TrackedCpuMemory trackedMemory && trackedMemory.Inner is IVirtualMemory trackedInner)
-		{
-			virtualMemory = trackedInner;
-			return true;
+			if (target is IVirtualMemory resolved)
+			{
+				virtualMemory = resolved;
+				return true;
+			}
+
+			if (target is not ICpuMemoryWrapper wrapper)
+			{
+				break;
+			}
+
+			var inner = wrapper.Inner;
+			if (inner is null || ReferenceEquals(inner, target))
+			{
+				break;
+			}
+
+			target = inner;
 		}
 
 		virtualMemory = null!;

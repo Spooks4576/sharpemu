@@ -62,6 +62,7 @@ public static class AvPlayerExports
 
         public void Dispose()
         {
+            AvPlayerMovieBridge.Clear(Handle);
             DecoderOutput?.Dispose();
             DecoderOutput = null;
             AudioDecoderOutput?.Dispose();
@@ -737,6 +738,7 @@ public static class AvPlayerExports
         {
             player.EndOfStream = true;
             player.PlaybackClock.Stop();
+            AvPlayerMovieBridge.Clear(player.Handle);
         }
         return SetReturn(ctx, 0);
     }
@@ -963,6 +965,13 @@ public static class AvPlayerExports
             return false;
         }
 
+        AvPlayerMovieBridge.PublishNv12(
+            player.Handle,
+            player.RawFrame,
+            checked((uint)player.Width),
+            checked((uint)player.Height),
+            checked((uint)player.Width));
+
         Span<byte> info = extended
             ? stackalloc byte[FrameInfoExSize]
             : stackalloc byte[FrameInfoSize];
@@ -984,7 +993,9 @@ public static class AvPlayerExports
     private static bool AllocateGuestVideoBuffers(CpuContext ctx, PlayerState player, int bufferSize)
     {
         var scheduler = GuestThreadExecution.Scheduler;
-        if (!player.TextureAllocatorFailed && player.AllocateTextureCallback != 0 && scheduler is not null)
+        if (!player.TextureAllocatorFailed &&
+            player.AllocateTextureCallback != 0 &&
+            scheduler is not null)
         {
             for (var index = 0; index < player.GuestBuffers.Length; index++)
             {

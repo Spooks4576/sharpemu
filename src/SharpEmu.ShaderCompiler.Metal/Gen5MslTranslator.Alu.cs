@@ -272,6 +272,8 @@ public static partial class Gen5MslTranslator
                     AsUInt($"(as_type<int>({RawSource(instruction, 1)}) >> (({RawSource(instruction, 0)}) & 31u))"),
                 "VBfeU32" =>
                     $"extract_bits({RawSource(instruction, 0)}, ({RawSource(instruction, 1)}) & 31u, ({RawSource(instruction, 2)}) & 31u)",
+                "VBfeI32" =>
+                    AsUInt($"extract_bits(as_type<int>({RawSource(instruction, 0)}), ({RawSource(instruction, 1)}) & 31u, ({RawSource(instruction, 2)}) & 31u)"),
                 "VBfiB32" =>
                     $"((({RawSource(instruction, 0)}) & ({RawSource(instruction, 1)})) | (~({RawSource(instruction, 0)}) & ({RawSource(instruction, 2)})))",
                 "VBfmB32" =>
@@ -626,6 +628,8 @@ public static partial class Gen5MslTranslator
             else
             {
                 var signed = opcode.EndsWith("I32", StringComparison.Ordinal);
+                var is64Bit = opcode.EndsWith("U64", StringComparison.Ordinal) ||
+                              opcode.EndsWith("I64", StringComparison.Ordinal);
                 var op = TrimCompare(opcode) switch
                 {
                     "Eq" => "==",
@@ -642,7 +646,9 @@ public static partial class Gen5MslTranslator
                     return false;
                 }
 
-                condition = signed
+                condition = is64Bit
+                    ? $"(({RawSource64(instruction, 0)}) {op} ({RawSource64(instruction, 1)}))"
+                    : signed
                     ? $"(as_type<int>({RawSource(instruction, 0)}) {op} as_type<int>({RawSource(instruction, 1)}))"
                     : $"(({RawSource(instruction, 0)}) {op} ({RawSource(instruction, 1)}))";
             }
