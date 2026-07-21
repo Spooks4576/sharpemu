@@ -103,6 +103,33 @@ public sealed class AvPlayerStreamInfoTests
     }
 
     [Fact]
+    public void VideoOnlySourceReportsOnlyTheVideoStream()
+    {
+        var memory = new FakeCpuMemory(BaseAddress, MemorySize);
+        var context = new CpuContext(memory, Generation.Gen5);
+        AvPlayerExports.RegisterPlayerForTest(
+            Handle,
+            1280,
+            720,
+            DurationMilliseconds,
+            hasAudio: false);
+
+        try
+        {
+            context[CpuRegister.Rdi] = Handle;
+            Assert.Equal(1, AvPlayerExports.AvPlayerStreamCount(context));
+
+            context[CpuRegister.Rsi] = 1;
+            context[CpuRegister.Rdx] = InfoAddress;
+            Assert.NotEqual(0, AvPlayerExports.AvPlayerGetStreamInfo(context));
+        }
+        finally
+        {
+            AvPlayerExports.RemovePlayerForTest(Handle);
+        }
+    }
+
+    [Fact]
     public void StreamInfoExExportIsRegisteredForGen5Only()
     {
         var gen4Manager = new ModuleManager();

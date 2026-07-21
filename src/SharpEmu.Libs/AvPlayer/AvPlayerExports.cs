@@ -21,6 +21,8 @@ public static class AvPlayerExports
     private const int StreamInfoSize = 32;
     private const int StreamInfoExSize = 32;
     private const int MaxGuestPathLength = 4096;
+    private const int DecoderWaitMilliseconds = 2;
+    private const double VideoOnlyTransitionLeadMilliseconds = 100.0;
     private static readonly object StateGate = new();
     private static readonly Dictionary<ulong, PlayerState> Players = new();
     private static int _traceCount;
@@ -38,33 +40,45 @@ public static class AvPlayerExports
         public int Height { get; set; }
         public double FramesPerSecond { get; set; } = 30.0;
         public ulong DurationMilliseconds { get; set; }
+        public bool HasAudio { get; set; } = true;
         public bool Started { get; set; }
         public bool Paused { get; set; }
         public bool Looping { get; set; }
-        public bool EndOfStream { get; set; }
+        public bool EndOfStream;
         public Process? Decoder { get; set; }
         public Stream? DecoderOutput { get; set; }
         public Process? AudioDecoder { get; set; }
         public Stream? AudioDecoderOutput { get; set; }
         public Stopwatch PlaybackClock { get; } = new();
+        public object VideoFrameGate { get; } = new();
         public byte[]? RawFrame { get; set; }
         public byte[]? RawAudioFrame { get; set; }
         public byte[]? PaddedFrame { get; set; }
+        public CancellationTokenSource? DecoderCancellation { get; set; }
+        public Task? DecoderTask { get; set; }
+        public CancellationTokenSource? PlaybackDeadlineCancellation { get; set; }
+        public Task? PlaybackDeadlineTask { get; set; }
+        public long DecodedFrameIndex { get; set; } = -1;
+        public long PresentedFrameIndex { get; set; } = -1;
+        public bool DecoderEndOfStream { get; set; }
         public ulong[] GuestBuffers { get; } = new ulong[FrameBufferCount];
         public bool TextureAllocatorFailed { get; set; }
         public int GuestBufferStride { get; set; }
         public int NextGuestBuffer { get; set; }
         public ulong LastGuestBuffer { get; set; }
-        public long NextFrameIndex { get; set; }
         public ulong AudioBufferBase { get; set; }
         public int NextAudioBuffer { get; set; }
         public long NextAudioFrameIndex { get; set; }
 
         public void Dispose()
         {
+            var decoderCancellation = DecoderCancellation;
+            var decoderTask = DecoderTask;
+            var playbackDeadlineCancellation = PlaybackDeadlineCancellation;
+            playbackDeadlineCancellation?.Cancel();
+            decoderCancellation?.Cancel();
+            // Cancel before Clear so an in-flight publication fails its generation check.
             AvPlayerMovieBridge.Clear(Handle);
-            DecoderOutput?.Dispose();
-            DecoderOutput = null;
             AudioDecoderOutput?.Dispose();
             AudioDecoderOutput = null;
             if (Decoder is not null)
@@ -81,10 +95,32 @@ public static class AvPlayerExports
                 }
                 finally
                 {
+                    DecoderOutput?.Dispose();
+                    DecoderOutput = null;
                     Decoder.Dispose();
                     Decoder = null;
                 }
             }
+            else
+            {
+                DecoderOutput?.Dispose();
+                DecoderOutput = null;
+            }
+            if (decoderTask is not null)
+            {
+                // Observe faults without blocking guest teardown.
+                _ = decoderTask.ContinueWith(
+                    static completed => _ = completed.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
+            DecoderTask = null;
+            DecoderCancellation = null;
+            decoderCancellation?.Dispose();
+            PlaybackDeadlineTask = null;
+            PlaybackDeadlineCancellation = null;
+            playbackDeadlineCancellation?.Dispose();
             if (AudioDecoder is not null)
             {
                 try
@@ -103,13 +139,20 @@ public static class AvPlayerExports
                     AudioDecoder = null;
                 }
             }
+            RawAudioFrame = null;
+            lock (VideoFrameGate)
+            {
+                RawFrame = null;
+                DecodedFrameIndex = -1;
+                PresentedFrameIndex = -1;
+                DecoderEndOfStream = false;
+            }
         }
 
         public void ResetPlayback()
         {
             Dispose();
             PlaybackClock.Reset();
-            NextFrameIndex = 0;
             NextAudioFrameIndex = 0;
             EndOfStream = false;
         }
@@ -283,6 +326,8 @@ public static class AvPlayerExports
             player.Started = true;
             player.Paused = false;
             player.EndOfStream = false;
+            player.PlaybackClock.Start();
+            StartPlaybackDeadline(player);
             Trace($"start handle=0x{player.Handle:X16}");
         }
 
@@ -357,7 +402,7 @@ public static class AvPlayerExports
             }
 
             player.Paused = false;
-            if (player.Decoder is not null)
+            if (player.Started)
             {
                 player.PlaybackClock.Start();
             }
@@ -380,6 +425,10 @@ public static class AvPlayerExports
             }
 
             player.Looping = ctx[CpuRegister.Rsi] != 0;
+            if (!player.Looping && player.Started)
+            {
+                StartPlaybackDeadline(player);
+            }
             return SetReturn(ctx, 0);
         }
     }
@@ -426,6 +475,8 @@ public static class AvPlayerExports
 
             player.ResetPlayback();
             player.Started = true;
+            player.PlaybackClock.Start();
+            StartPlaybackDeadline(player);
             return SetReturn(ctx, 0);
         }
     }
@@ -449,7 +500,7 @@ public static class AvPlayerExports
             return SetReturn(
                 ctx,
                 Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) &&
-                player.Started && !player.EndOfStream ? 1 : 0);
+                player.Started && !HasPlaybackEnded(player) ? 1 : 0);
         }
     }
 
@@ -478,8 +529,8 @@ public static class AvPlayerExports
         lock (StateGate)
         {
             if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
-                infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
-                player.SourcePath is null || !EnsureAudioDecoder(player))
+                infoAddress == 0 || !player.Started || player.Paused || HasPlaybackEnded(player) ||
+                player.SourcePath is null)
             {
                 return SetReturn(ctx, 0);
             }
@@ -488,7 +539,7 @@ public static class AvPlayerExports
             const int channelCount = 2;
             const int sampleRate = 48_000;
             const int audioFrameSize = samplesPerFrame * channelCount * sizeof(short);
-            if (player.RawAudioFrame is null ||
+            if (!EnsureAudioDecoder(player) || player.RawAudioFrame is null ||
                 !ReadExactly(player.AudioDecoderOutput, player.RawAudioFrame))
             {
                 return SetReturn(ctx, 0);
@@ -561,7 +612,11 @@ public static class AvPlayerExports
     {
         lock (StateGate)
         {
-            return SetReturn(ctx, Players.ContainsKey(ctx[CpuRegister.Rdi]) ? 2 : InvalidParameters);
+            return SetReturn(
+                ctx,
+                Players.TryGetValue(ctx[CpuRegister.Rdi], out var player)
+                    ? player.HasAudio ? 2 : 1
+                    : InvalidParameters);
         }
     }
 
@@ -569,7 +624,8 @@ public static class AvPlayerExports
         ulong handle,
         int width,
         int height,
-        ulong durationMilliseconds)
+        ulong durationMilliseconds,
+        bool hasAudio = true)
     {
         PlayerState? previous;
         lock (StateGate)
@@ -581,6 +637,7 @@ public static class AvPlayerExports
                 Width = width,
                 Height = height,
                 DurationMilliseconds = durationMilliseconds,
+                HasAudio = hasAudio,
             };
         }
 
@@ -613,7 +670,8 @@ public static class AvPlayerExports
         lock (StateGate)
         {
             if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
-                streamIndex > 1 || infoAddress == 0 || player.Width <= 0 || player.Height <= 0)
+                streamIndex >= (player.HasAudio ? 2u : 1u) ||
+                infoAddress == 0 || player.Width <= 0 || player.Height <= 0)
             {
                 return SetReturn(ctx, InvalidParameters);
             }
@@ -660,6 +718,7 @@ public static class AvPlayerExports
                 Console.Error.WriteLine($"[AVPLAYER][ERROR] Could not open guest video '{guestPath}' (resolved '{hostPath ?? "<none>"}').");
                 return SetReturn(ctx, OperationFailed);
             }
+            _ = TryProbeHasAudio(hostPath, out var hasAudio);
 
             player.ResetPlayback();
             player.SourcePath = hostPath;
@@ -667,9 +726,15 @@ public static class AvPlayerExports
             player.Height = height;
             player.FramesPerSecond = fps;
             player.DurationMilliseconds = duration;
+            player.HasAudio = hasAudio;
             player.Started = player.AutoStart;
             autoStart = player.AutoStart;
-            Trace($"source guest='{guestPath}' host='{hostPath}' {width}x{height} fps={fps:F3} duration_ms={duration} auto_start={player.AutoStart}");
+            if (autoStart)
+            {
+                player.PlaybackClock.Start();
+                StartPlaybackDeadline(player);
+            }
+            Trace($"source guest='{guestPath}' host='{hostPath}' {width}x{height} fps={fps:F3} duration_ms={duration} audio={hasAudio} auto_start={player.AutoStart}");
         }
 
 
@@ -687,7 +752,7 @@ public static class AvPlayerExports
         lock (StateGate)
         {
             if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
-                infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
+                infoAddress == 0 || !player.Started || player.Paused || HasPlaybackEnded(player) ||
                 player.SourcePath is null)
             {
                 return SetReturn(ctx, 0);
@@ -700,26 +765,35 @@ public static class AvPlayerExports
             }
 
             var fps = Math.Max(1.0, player.FramesPerSecond);
-            var expectedFrame = (long)Math.Floor(player.PlaybackClock.Elapsed.TotalSeconds * fps);
-            while (player.NextFrameIndex < expectedFrame)
+            long frameIndex = -1;
+            ulong timestamp = 0;
+            bool decoderEndOfStream;
+            bool frameAvailable;
+            lock (player.VideoFrameGate)
             {
-                if (!ReadFrame(player))
+                frameIndex = player.DecodedFrameIndex;
+                frameAvailable = frameIndex > player.PresentedFrameIndex;
+                if (!frameAvailable)
                 {
-                    return FinishStream(ctx, player);
+                    decoderEndOfStream = player.DecoderEndOfStream;
                 }
-                player.NextFrameIndex++;
-            }
+                else
+                {
+                    decoderEndOfStream = false;
+                    timestamp = checked((ulong)Math.Round(frameIndex * 1000.0 / fps));
+                    if (!WriteVideoFrame(ctx, player, infoAddress, timestamp, extended))
+                    {
+                        return SetReturn(ctx, 0);
+                    }
 
-            if (!ReadFrame(player))
-            {
-                return FinishStream(ctx, player);
+                    player.PresentedFrameIndex = frameIndex;
+                }
             }
-
-            var timestamp = checked((ulong)Math.Round(player.NextFrameIndex * 1000.0 / fps));
-            player.NextFrameIndex++;
-            if (!WriteVideoFrame(ctx, player, infoAddress, timestamp, extended))
+            if (!frameAvailable)
             {
-                return SetReturn(ctx, 0);
+                return decoderEndOfStream
+                    ? FinishStream(ctx, player)
+                    : SetReturn(ctx, 0);
             }
 
             Trace($"video_frame handle=0x{player.Handle:X16} ex={extended} ts={timestamp} data=0x{player.LastGuestBuffer:X16}");
@@ -733,6 +807,8 @@ public static class AvPlayerExports
         {
             player.ResetPlayback();
             player.Started = true;
+            player.PlaybackClock.Start();
+            StartPlaybackDeadline(player);
         }
         else
         {
@@ -741,6 +817,99 @@ public static class AvPlayerExports
             AvPlayerMovieBridge.Clear(player.Handle);
         }
         return SetReturn(ctx, 0);
+    }
+
+    private static bool HasPlaybackEnded(PlayerState player)
+    {
+        if (Volatile.Read(ref player.EndOfStream))
+        {
+            return true;
+        }
+        if (player.Looping || !player.Started || player.DurationMilliseconds == 0 ||
+            !player.PlaybackClock.IsRunning)
+        {
+            return false;
+        }
+
+        var frameCount = PlaybackFrameCount(player.DurationMilliseconds, player.FramesPerSecond);
+        var completionMilliseconds = frameCount is > 1 and < long.MaxValue
+            ? (frameCount - 1) * 1000.0 / player.FramesPerSecond
+            : player.DurationMilliseconds;
+        if (!player.HasAudio)
+        {
+            // Leave headroom for the audio worker used by video-only Unreal media.
+            completionMilliseconds = Math.Max(
+                0,
+                completionMilliseconds - VideoOnlyTransitionLeadMilliseconds);
+        }
+        if (player.PlaybackClock.Elapsed.TotalMilliseconds < completionMilliseconds)
+        {
+            return false;
+        }
+
+        player.PlaybackClock.Stop();
+        Volatile.Write(ref player.EndOfStream, true);
+        Trace(
+            $"clock_eof handle=0x{player.Handle:X16} " +
+            $"elapsed_ms={player.PlaybackClock.Elapsed.TotalMilliseconds:F0} " +
+            $"deadline_ms={completionMilliseconds:F0}");
+        return true;
+    }
+
+    private static void StartPlaybackDeadline(PlayerState player)
+    {
+        var previousCancellation = player.PlaybackDeadlineCancellation;
+        previousCancellation?.Cancel();
+        previousCancellation?.Dispose();
+
+        var cancellation = new CancellationTokenSource();
+        player.PlaybackDeadlineCancellation = cancellation;
+        player.PlaybackDeadlineTask = Task.Factory.StartNew(
+            () => MonitorPlaybackDeadline(player, cancellation.Token),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach,
+            TaskScheduler.Default);
+    }
+
+    private static void MonitorPlaybackDeadline(
+        PlayerState player,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                if (cancellationToken.WaitHandle.WaitOne(10))
+                {
+                    return;
+                }
+
+                bool ended;
+                lock (StateGate)
+                {
+                    if (cancellationToken.IsCancellationRequested ||
+                        !Players.TryGetValue(player.Handle, out var current) ||
+                        !ReferenceEquals(current, player) || !player.Started || player.Looping)
+                    {
+                        return;
+                    }
+                    ended = HasPlaybackEnded(player);
+                }
+
+                if (ended)
+                {
+                    // Playback duration is independent of decoder throughput.
+                    AvPlayerMovieBridge.Clear(player.Handle);
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
     }
 
     private static bool EnsureDecoder(PlayerState player)
@@ -794,9 +963,23 @@ public static class AvPlayerExports
                 }
             };
             player.Decoder.BeginErrorReadLine();
-            player.DecoderOutput = player.Decoder.StandardOutput.BaseStream;
-            player.RawFrame = new byte[checked(player.Width * player.Height * 3 / 2)];
+            var decoderOutput = player.Decoder.StandardOutput.BaseStream;
+            player.DecoderOutput = decoderOutput;
+            var cancellation = new CancellationTokenSource();
+            player.DecoderCancellation = cancellation;
+            lock (player.VideoFrameGate)
+            {
+                player.RawFrame = null;
+                player.DecodedFrameIndex = -1;
+                player.PresentedFrameIndex = -1;
+                player.DecoderEndOfStream = false;
+            }
             player.PlaybackClock.Start();
+            player.DecoderTask = Task.Factory.StartNew(
+                () => DecodeVideoFrames(player, decoderOutput, cancellation.Token),
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach,
+                TaskScheduler.Default);
             Trace($"decoder_started pid={player.Decoder.Id} source='{player.SourcePath}'");
             return true;
         }
@@ -808,8 +991,140 @@ public static class AvPlayerExports
         }
     }
 
+    private static void DecodeVideoFrames(
+        PlayerState player,
+        Stream decoderOutput,
+        CancellationToken cancellationToken)
+    {
+        var frameSize = checked(player.Width * player.Height * 3 / 2);
+        var writeBuffer = new byte[frameSize];
+        var fps = Math.Max(1.0, player.FramesPerSecond);
+        var expectedFrameCount = PlaybackFrameCount(player.DurationMilliseconds, fps);
+        long frameIndex = 0;
+        long droppedFrames = 0;
+
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested &&
+                   !Volatile.Read(ref player.EndOfStream))
+            {
+                var targetFrame = PlaybackFrameIndex(player.PlaybackClock.Elapsed, fps);
+                if (frameIndex > targetFrame)
+                {
+                    if (cancellationToken.WaitHandle.WaitOne(DecoderWaitMilliseconds))
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
+                if (!ReadExactly(decoderOutput, writeBuffer))
+                {
+                    break;
+                }
+                if (cancellationToken.IsCancellationRequested ||
+                    Volatile.Read(ref player.EndOfStream))
+                {
+                    break;
+                }
+
+                // Drop frames that became stale during decode on the host worker.
+                targetFrame = PlaybackFrameIndex(player.PlaybackClock.Elapsed, fps);
+                if (frameIndex < targetFrame)
+                {
+                    frameIndex++;
+                    droppedFrames++;
+                    if (frameIndex >= expectedFrameCount)
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
+                byte[] publishedFrame;
+                lock (player.VideoFrameGate)
+                {
+                    publishedFrame = writeBuffer;
+                    writeBuffer = player.RawFrame ?? new byte[frameSize];
+                    player.RawFrame = publishedFrame;
+                    player.DecodedFrameIndex = frameIndex;
+                }
+
+                // Keep host conversion and scaling off the guest media thread.
+                AvPlayerMovieBridge.PublishNv12(
+                    player.Handle,
+                    publishedFrame,
+                    checked((uint)player.Width),
+                    checked((uint)player.Height),
+                    checked((uint)player.Width));
+                frameIndex++;
+                if (frameIndex >= expectedFrameCount)
+                {
+                    break;
+                }
+            }
+        }
+        catch (Exception exception) when (
+            cancellationToken.IsCancellationRequested &&
+            exception is IOException or ObjectDisposedException)
+        {
+        }
+        catch (IOException exception)
+        {
+            Console.Error.WriteLine($"[AVPLAYER][ERROR] FFmpeg stream read failed: {exception.Message}");
+        }
+        finally
+        {
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                lock (player.VideoFrameGate)
+                {
+                    player.DecoderEndOfStream = true;
+                }
+                if (!player.Looping)
+                {
+                    // Publish EOF even if the guest stops polling at the advertised duration.
+                    player.PlaybackClock.Stop();
+                    Volatile.Write(ref player.EndOfStream, true);
+                    AvPlayerMovieBridge.Clear(player.Handle);
+                }
+                Trace(
+                    $"decoder_eof handle=0x{player.Handle:X16} " +
+                    $"decoded={frameIndex} dropped={droppedFrames}");
+            }
+        }
+    }
+
+    internal static long PlaybackFrameIndex(TimeSpan elapsed, double framesPerSecond)
+    {
+        if (elapsed <= TimeSpan.Zero || !double.IsFinite(framesPerSecond) || framesPerSecond <= 0)
+        {
+            return 0;
+        }
+
+        return Math.Max(0, (long)Math.Floor(elapsed.TotalSeconds * framesPerSecond));
+    }
+
+    internal static long PlaybackFrameCount(ulong durationMilliseconds, double framesPerSecond)
+    {
+        if (durationMilliseconds == 0 || !double.IsFinite(framesPerSecond) || framesPerSecond <= 0)
+        {
+            return long.MaxValue;
+        }
+
+        return Math.Max(
+            1,
+            checked((long)Math.Round(
+                durationMilliseconds * framesPerSecond / 1000.0,
+                MidpointRounding.AwayFromZero)));
+    }
+
     private static bool EnsureAudioDecoder(PlayerState player)
     {
+        if (!player.HasAudio)
+        {
+            return false;
+        }
         if (player.AudioDecoderOutput is not null)
         {
             return true;
@@ -872,24 +1187,6 @@ public static class AvPlayerExports
             player.AudioDecoderOutput = null;
             player.AudioDecoder?.Dispose();
             player.AudioDecoder = null;
-            return false;
-        }
-    }
-
-    private static bool ReadFrame(PlayerState player)
-    {
-        if (player.DecoderOutput is null || player.RawFrame is null)
-        {
-            return false;
-        }
-
-        try
-        {
-            return ReadExactly(player.DecoderOutput, player.RawFrame);
-        }
-        catch (IOException exception)
-        {
-            Console.Error.WriteLine($"[AVPLAYER][ERROR] FFmpeg stream read failed: {exception.Message}");
             return false;
         }
     }
@@ -964,13 +1261,6 @@ public static class AvPlayerExports
         {
             return false;
         }
-
-        AvPlayerMovieBridge.PublishNv12(
-            player.Handle,
-            player.RawFrame,
-            checked((uint)player.Width),
-            checked((uint)player.Height),
-            checked((uint)player.Width));
 
         Span<byte> info = extended
             ? stackalloc byte[FrameInfoExSize]
@@ -1138,6 +1428,65 @@ public static class AvPlayerExports
         catch (Exception exception) when (exception is IOException or InvalidOperationException or System.ComponentModel.Win32Exception)
         {
             Console.Error.WriteLine($"[AVPLAYER][ERROR] Failed to probe video: {exception.Message}");
+            return false;
+        }
+    }
+
+    private static bool TryProbeHasAudio(string path, out bool hasAudio)
+    {
+        // Preserve the conservative audio-present behavior if probing fails.
+        hasAudio = true;
+        var ffmpeg = FindFfmpeg();
+        if (ffmpeg is null)
+        {
+            return false;
+        }
+        var ffprobe = GetFfprobePath(ffmpeg, OperatingSystem.IsWindows());
+        if (!File.Exists(ffprobe))
+        {
+            return false;
+        }
+
+        var startInfo = new ProcessStartInfo(ffprobe)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        startInfo.ArgumentList.Add("-v");
+        startInfo.ArgumentList.Add("error");
+        startInfo.ArgumentList.Add("-select_streams");
+        startInfo.ArgumentList.Add("a:0");
+        startInfo.ArgumentList.Add("-show_entries");
+        startInfo.ArgumentList.Add("stream=index");
+        startInfo.ArgumentList.Add("-of");
+        startInfo.ArgumentList.Add("csv=p=0");
+        startInfo.ArgumentList.Add(path);
+
+        try
+        {
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return false;
+            }
+            var output = process.StandardOutput.ReadToEnd();
+            var error = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            if (process.ExitCode != 0)
+            {
+                Console.Error.WriteLine($"[AVPLAYER][FFPROBE] {error.Trim()}");
+                return false;
+            }
+
+            hasAudio = !string.IsNullOrWhiteSpace(output);
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            Console.Error.WriteLine($"[AVPLAYER][ERROR] Failed to probe audio streams: {exception.Message}");
             return false;
         }
     }
@@ -1595,7 +1944,10 @@ public static class AvPlayerExports
     private static void Trace(string message)
     {
         var count = Interlocked.Increment(ref _traceCount);
-        if (count <= 32 || count % 300 == 0)
+        if (count <= 32 || count % 300 == 0 ||
+            message.StartsWith("source ", StringComparison.Ordinal) ||
+            message.StartsWith("clock_eof ", StringComparison.Ordinal) ||
+            message.StartsWith("decoder_eof ", StringComparison.Ordinal))
         {
             Console.Error.WriteLine($"[AVPLAYER][INFO] {message}");
         }

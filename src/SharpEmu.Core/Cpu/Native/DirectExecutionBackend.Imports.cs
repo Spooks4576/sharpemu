@@ -1783,7 +1783,11 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		var elapsedTicks = Stopwatch.GetTimestamp() - _importLoopPatternStartTimestamp;
-		return elapsedTicks >= (long)(_importLoopGuardSeconds * Stopwatch.Frequency);
+		// Time polling can be a legitimate timed wait, so use a wider watchdog window.
+		long guardSeconds = string.Equals(entry.Nid, "n88vx3C5nW8", StringComparison.Ordinal)
+			? (long)_importLoopGuardSeconds * 2
+			: _importLoopGuardSeconds;
+		return elapsedTicks >= guardSeconds * Stopwatch.Frequency;
 	}
 
 	private static bool IsImportLoopGuardBoundary(string nid) =>

@@ -74,6 +74,12 @@ public static class KernelRuntimeCompatExports
     [ThreadStatic]
     private static int _shortUsleepCount;
 
+    [ThreadStatic]
+    private static int _gettimeofdayBurstCount;
+
+    [ThreadStatic]
+    private static long _lastGettimeofdayTimestamp;
+
     private static readonly bool _stopwatchTicksAreNanoseconds =
         Stopwatch.Frequency == 1_000_000_000L;
 
@@ -292,8 +298,27 @@ public static class KernelRuntimeCompatExports
             return -1;
         }
 
+        YieldDuringGettimeofdayBurst();
         ctx[CpuRegister.Rax] = 0;
         return 0;
+    }
+
+    private static void YieldDuringGettimeofdayBurst()
+    {
+        var timestamp = Stopwatch.GetTimestamp();
+        var previous = _lastGettimeofdayTimestamp;
+        _lastGettimeofdayTimestamp = timestamp;
+
+        // Yield during hot polling without affecting isolated calls.
+        if (previous == 0 || timestamp - previous > Stopwatch.Frequency / 100)
+        {
+            _gettimeofdayBurstCount = 0;
+            return;
+        }
+        if ((++_gettimeofdayBurstCount & 0xFF) == 0)
+        {
+            Thread.Yield();
+        }
     }
 
     [SysAbiExport(
