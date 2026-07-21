@@ -302,7 +302,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         };
     }
 
-    public ulong AllocateAt(ulong desiredAddress, ulong size, bool executable = true, bool allowAlternative = true)
+    public ulong AllocateAt(ulong desiredAddress, ulong size, bool executable = true, bool allowAlternative = true) =>
+        AllocateAtCore(desiredAddress, size, executable, allowAlternative, primeReserved: true);
+
+    private ulong AllocateAtCore(ulong desiredAddress, ulong size, bool executable, bool allowAlternative, bool primeReserved)
     {
         if (size == 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be greater than zero");
@@ -370,7 +373,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var actualAddress = result;
 
         var lazyPrimeState = "n/a";
-        if (reservedOnly)
+        if (reservedOnly && primeReserved)
         {
             var primeBytes = Math.Min(alignedSize, LazyReservePrimeBytes);
             if (primeBytes != 0)
@@ -540,7 +543,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 : alignedSize;
             try
             {
-                var posixAddress = AllocateAt(cursor, reserveSize, executable, allowAlternative: true);
+                // Reserve only — no lazy-prime commit — so a large data range costs no
+                // host RAM up front, matching the exact-search (Linux) path below.
+                var posixAddress = AllocateAtCore(cursor, reserveSize, executable, allowAlternative: true, primeReserved: false);
                 if (posixAddress != 0)
                 {
                     var alignedBase = AlignUp(posixAddress, effectiveAlignment);
