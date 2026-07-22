@@ -33,6 +33,7 @@ public sealed class DebugCommandDispatcher
             {
                 ["state"] = _session.State.ToString(),
             }),
+            "threads" or "list-threads" => Threads(request),
             "registers" or "regs" => Registers(request),
             "set-register" or "set-reg" => SetRegister(request),
             "read-memory" or "read-mem" => ReadMemory(request),
@@ -68,6 +69,37 @@ public sealed class DebugCommandDispatcher
         }
 
         return DebugResponse.Success(request.Command, data);
+    }
+
+    private DebugResponse Threads(DebugRequest request)
+    {
+        var threads = _session.SnapshotThreads()
+            .Select(thread => new Dictionary<string, object?>
+            {
+                ["handle"] = FormatAddress(thread.ThreadHandle),
+                ["name"] = thread.Name,
+                ["state"] = thread.State,
+                ["importCount"] = thread.ImportCount,
+                ["lastImportNid"] = thread.LastImportNid,
+                ["lastReturnRip"] = FormatAddress(thread.LastReturnRip),
+                ["lastImportRdi"] = FormatAddress(thread.LastImportRdi),
+                ["lastImportRsi"] = FormatAddress(thread.LastImportRsi),
+                ["lastImportRdx"] = FormatAddress(thread.LastImportRdx),
+                ["lastImportRcx"] = FormatAddress(thread.LastImportRcx),
+                ["blockReason"] = thread.BlockReason,
+                ["blockWakeKey"] = thread.BlockWakeKey,
+                ["continuationRip"] = FormatAddress(thread.ContinuationRip),
+                ["continuationRsp"] = FormatAddress(thread.ContinuationRsp),
+                ["continuationRbp"] = FormatAddress(thread.ContinuationRbp),
+                ["blockWaiterState"] = thread.BlockWaiterState,
+                ["backtrace"] = thread.Backtrace.Select(FormatAddress).ToArray(),
+            })
+            .ToArray();
+
+        return DebugResponse.Success(request.Command, new Dictionary<string, object?>
+        {
+            ["threads"] = threads,
+        });
     }
 
     private DebugResponse Registers(DebugRequest request)

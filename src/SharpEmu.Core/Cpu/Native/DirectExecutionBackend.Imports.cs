@@ -279,6 +279,7 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.LastImportRcx = num4;
 			activeGuestThreadState.LastImportR8 = num5;
 			activeGuestThreadState.LastImportR9 = num6;
+			activeGuestThreadState.LastImportRbp = value4;
 			activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
 			activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
 			activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
@@ -1292,6 +1293,7 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.LastImportRcx = *(ulong*)(argPackPtr + 24);
 			activeGuestThreadState.LastImportR8 = *(ulong*)(argPackPtr + 32);
 			activeGuestThreadState.LastImportR9 = *(ulong*)(argPackPtr + 40);
+			activeGuestThreadState.LastImportRbp = *(ulong*)(argPackPtr + 56);
 			activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
 			activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
 			activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);

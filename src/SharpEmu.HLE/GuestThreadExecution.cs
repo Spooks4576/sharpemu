@@ -21,7 +21,17 @@ public readonly record struct GuestThreadSnapshot(
     long ImportCount,
     string? LastImportNid,
     ulong LastReturnRip,
-    string? BlockReason);
+    string? BlockReason,
+    ulong LastImportRdi,
+    ulong LastImportRsi,
+    ulong LastImportRdx,
+    ulong LastImportRcx,
+    string? BlockWakeKey,
+    ulong ContinuationRip,
+    ulong ContinuationRsp,
+    ulong ContinuationRbp,
+    string? BlockWaiterState,
+    IReadOnlyList<ulong> Backtrace);
 
 /// <summary>
 /// Continuation state for a blocked guest thread, replacing the closure pair a blocking
@@ -32,6 +42,8 @@ public readonly record struct GuestThreadSnapshot(
 /// </summary>
 public interface IGuestThreadBlockWaiter
 {
+    string? DebugState { get; }
+
     int Resume();
 
     bool TryWake();
@@ -156,12 +168,19 @@ public static class GuestThreadExecution
     {
         private readonly Func<int> _resume;
         private readonly Func<bool> _tryWake;
+        private readonly Func<string?>? _debugState;
 
-        public DelegateGuestThreadBlockWaiter(Func<int> resume, Func<bool> tryWake)
+        public DelegateGuestThreadBlockWaiter(
+            Func<int> resume,
+            Func<bool> tryWake,
+            Func<string?>? debugState)
         {
             _resume = resume;
             _tryWake = tryWake;
+            _debugState = debugState;
         }
+
+        public string? DebugState => _debugState?.Invoke();
 
         public int Resume() => _resume();
 
@@ -295,11 +314,22 @@ public static class GuestThreadExecution
             return false;
         }
 
+        GuestCpuContinuation continuation = default;
+        var hasContinuation = context is not null &&
+            TryCaptureCurrentBlockContinuation(context, out continuation);
+
+        // Yielding a context-backed wait without a resumable continuation would
+        // lose the guest thread. Context-less requests remain as a test bridge.
+        if (context is not null && !hasContinuation)
+        {
+            return false;
+        }
+
         _pendingBlockReason = string.IsNullOrWhiteSpace(reason) ? "guest_thread_blocked" : reason;
         _pendingBlockWakeKey = string.IsNullOrWhiteSpace(wakeKey) ? _pendingBlockReason : wakeKey;
         _pendingBlockWaiter = waiter;
         _pendingBlockDeadlineTimestamp = blockDeadlineTimestamp;
-        if (context is not null && TryCaptureCurrentBlockContinuation(context, out var continuation))
+        if (hasContinuation)
         {
             _pendingBlockContinuation = continuation;
             _pendingBlockContinuationValid = true;
@@ -322,12 +352,13 @@ public static class GuestThreadExecution
         string? wakeKey,
         Func<int> resumeHandler,
         Func<bool> wakeHandler,
-        long blockDeadlineTimestamp = 0) =>
+        long blockDeadlineTimestamp = 0,
+        Func<string?>? debugStateHandler = null) =>
         RequestCurrentThreadBlock(
             context,
             reason,
             wakeKey,
-            new DelegateGuestThreadBlockWaiter(resumeHandler, wakeHandler),
+            new DelegateGuestThreadBlockWaiter(resumeHandler, wakeHandler, debugStateHandler),
             blockDeadlineTimestamp);
 
     public static bool TryConsumeCurrentThreadBlock(out string reason)

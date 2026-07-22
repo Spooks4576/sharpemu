@@ -101,6 +101,8 @@ public static class KernelEventQueueCompatExports
         public required int EventCapacity { get; init; }
         public required ulong OutCountAddress { get; init; }
 
+        public string DebugState => $"equeue=0x{Handle:X16}";
+
         public int Resume() => ResumeWaitEqueue(Ctx, Handle, EventsAddress, EventCapacity, OutCountAddress);
 
         public bool TryWake() => HasPendingEvents(Handle);
@@ -631,8 +633,7 @@ public static class KernelEventQueueCompatExports
                     (wakeHandles ??= new List<ulong>()).Add(handle);
                     triggeredCount++;
 
-                    // A single queue only needs to be woken once, even if multiple
-                    // registrations matched.
+                    // The filter-only fallback wakes one interrupt source per queue.
                     break;
                 }
             }

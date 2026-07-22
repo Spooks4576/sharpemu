@@ -174,6 +174,8 @@ public static class KernelPthreadExtendedCompatExports
         public required ulong ThreadId { get; init; }
         public required bool Write { get; init; }
 
+        public string DebugState => $"rwlock thread=0x{ThreadId:X16} write={Write}";
+
         public int Resume() => (int)OrbisGen2Result.ORBIS_GEN2_OK;
 
         public bool TryWake() => TryAcquireBlockedRwlock(Rwlock, ThreadId, Write);
@@ -1041,17 +1043,33 @@ public static class KernelPthreadExtendedCompatExports
         var syntheticHandle = AllocateSyntheticHandle(SyntheticRwlockHandleBase, ref _nextSyntheticRwlockHandleId);
         lock (_stateGate)
         {
-            var resolvedAddress = ResolveRwlockHandle(ctx, rwlockAddress);
-            if (_rwlockStates.Remove(resolvedAddress, out var existing))
+            if (_rwlockStates.TryGetValue(rwlockAddress, out var existing))
             {
+                lock (existing.SyncRoot)
+                {
+                    if (existing.WriterThreadId != 0 ||
+                        existing.ReaderTotalCount != 0 ||
+                        existing.WaitingWriters != 0 ||
+                        existing.CompatWriterTotalCount != 0)
+                    {
+                        return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+                    }
+                }
+
+                RemoveRwlockStateAliasesLocked(existing);
             }
 
             var rwlock = new PthreadRwlockState();
-            _rwlockStates[rwlockAddress] = rwlock;
             _rwlockStates[syntheticHandle] = rwlock;
+            if (!KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, rwlockAddress, syntheticHandle))
+            {
+                _rwlockStates.Remove(syntheticHandle);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            _rwlockStates[rwlockAddress] = rwlock;
         }
 
-        _ = KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, rwlockAddress, syntheticHandle);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1098,11 +1116,7 @@ public static class KernelPthreadExtendedCompatExports
 
         lock (_stateGate)
         {
-            _rwlockStates.Remove(resolvedAddress);
-            if (resolvedAddress != rwlockAddress)
-            {
-                _rwlockStates.Remove(rwlockAddress);
-            }
+            RemoveRwlockStateAliasesLocked(state);
         }
 
         _ = KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, rwlockAddress, 0);
@@ -1801,14 +1815,48 @@ public static class KernelPthreadExtendedCompatExports
         var syntheticHandle = AllocateSyntheticHandle(SyntheticRwlockHandleBase, ref _nextSyntheticRwlockHandleId);
         lock (_stateGate)
         {
-            _rwlockStates[rwlockAddress] = createdRwlock;
+            if (_rwlockStates.TryGetValue(rwlockAddress, out rwlock))
+            {
+                resolvedAddress = rwlockAddress;
+                return true;
+            }
+
             _rwlockStates[syntheticHandle] = createdRwlock;
+            if (!KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, rwlockAddress, syntheticHandle))
+            {
+                _rwlockStates.Remove(syntheticHandle);
+                return false;
+            }
+
+            _rwlockStates[rwlockAddress] = createdRwlock;
         }
 
-        _ = KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, rwlockAddress, syntheticHandle);
         resolvedAddress = syntheticHandle;
         rwlock = createdRwlock;
         return true;
+    }
+
+    // Remove every alias so recycled guest objects cannot resolve stale state.
+    private static void RemoveRwlockStateAliasesLocked(PthreadRwlockState state)
+    {
+        List<ulong>? aliases = null;
+        foreach (var (address, candidate) in _rwlockStates)
+        {
+            if (ReferenceEquals(candidate, state))
+            {
+                (aliases ??= new List<ulong>()).Add(address);
+            }
+        }
+
+        if (aliases is null)
+        {
+            return;
+        }
+
+        foreach (var address in aliases)
+        {
+            _rwlockStates.Remove(address);
+        }
     }
 
     private static ulong AllocateSyntheticHandle(ulong baseAddress, ref long nextId)

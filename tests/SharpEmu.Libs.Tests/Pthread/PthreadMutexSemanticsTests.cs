@@ -196,6 +196,25 @@ public sealed class PthreadMutexSemanticsTests
         Assert.Equal(workerCount * iterationsPerWorker, protectedCounter);
     }
 
+    [Fact]
+    public void ReinitializingOwnedMutex_ReturnsBusyWithoutOrphaningOwner()
+    {
+        const ulong memoryBase = 0x4_0000_0000;
+        const ulong mutexAddress = memoryBase + 0x100;
+        var memory = new AllocatingCpuMemory(memoryBase, 0x4000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = mutexAddress;
+        context[CpuRegister.Rsi] = 0;
+
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexInit(context));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
+        Assert.NotEqual(0, KernelPthreadCompatExports.PthreadMutexInit(context));
+
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexTrylock(context));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+    }
+
     private sealed class AllocatingCpuMemory : ICpuMemory, IGuestMemoryAllocator
     {
         private readonly ulong _baseAddress;

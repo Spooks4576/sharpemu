@@ -468,6 +468,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		public ulong LastImportRcx;
 		public ulong LastImportR8;
 		public ulong LastImportR9;
+		public ulong LastImportRbp;
 		public ulong LastImportStack0;
 		public ulong LastImportStack1;
 		public ulong LastImportStack2;
@@ -3324,6 +3325,54 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return wakeCount;
 	}
 
+	private static IReadOnlyList<ulong> CaptureGuestThreadBacktrace(GuestThreadState thread)
+	{
+		ulong firstRip;
+		ulong rbp;
+		if (thread.HasBlockedContinuation)
+		{
+			firstRip = thread.BlockedContinuation.Rip;
+			rbp = thread.BlockedContinuation.Rbp;
+		}
+		else if (thread.State == GuestThreadRunState.Running)
+		{
+			// Running threads lack a continuation, so use their last coherent import frame.
+			// LastImportNid is published after these frame values.
+			firstRip = Volatile.Read(ref thread.LastReturnRip);
+			rbp = Volatile.Read(ref thread.LastImportRbp);
+		}
+		else
+		{
+			return [];
+		}
+
+		if (firstRip < 0x10000)
+		{
+			return [];
+		}
+
+		var frames = new List<ulong>(16) { firstRip };
+		for (var depth = 0; depth < 15 && rbp >= 0x10000; depth++)
+		{
+			if (!thread.Context.TryReadUInt64(rbp, out var nextRbp) ||
+				!thread.Context.TryReadUInt64(rbp + 8, out var returnRip) ||
+				returnRip < 0x10000)
+			{
+				break;
+			}
+
+			frames.Add(returnRip);
+			if (nextRbp <= rbp || nextRbp - rbp > 0x100000)
+			{
+				break;
+			}
+
+			rbp = nextRbp;
+		}
+
+		return frames;
+	}
+
 	public IReadOnlyList<GuestThreadSnapshot> SnapshotThreads()
 	{
 		using (LockGate("SnapshotThreads"))
@@ -3339,7 +3388,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					Interlocked.Read(ref thread.ImportCount),
 					Volatile.Read(ref thread.LastImportNid),
 					Volatile.Read(ref thread.LastReturnRip),
-					thread.BlockReason);
+					thread.BlockReason,
+					Volatile.Read(ref thread.LastImportRdi),
+					Volatile.Read(ref thread.LastImportRsi),
+					Volatile.Read(ref thread.LastImportRdx),
+					Volatile.Read(ref thread.LastImportRcx),
+					thread.BlockWakeKey,
+					thread.HasBlockedContinuation ? thread.BlockedContinuation.Rip : 0,
+					thread.HasBlockedContinuation ? thread.BlockedContinuation.Rsp : 0,
+					thread.HasBlockedContinuation ? thread.BlockedContinuation.Rbp : 0,
+					thread.BlockWaiter?.DebugState,
+					CaptureGuestThreadBacktrace(thread));
 			}
 
 			return snapshots;

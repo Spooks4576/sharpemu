@@ -3,6 +3,8 @@
 
 namespace SharpEmu.Debugger.Session;
 
+using SharpEmu.HLE;
+
 /// <summary>
 /// The inspection and control surface a debugger front-end (for example a
 /// network server) drives. Register and memory accessors succeed only while the
@@ -16,6 +18,9 @@ public interface IDebugTarget
 
     /// <summary>The most recent stop, or null if the target has not stopped yet.</summary>
     DebugStopEvent? LastStop { get; }
+
+    /// <summary>Returns a thread-safe snapshot of all guest worker threads.</summary>
+    IReadOnlyList<GuestThreadSnapshot> SnapshotThreads();
 
     /// <summary>Reads the integer register file. Fails unless paused.</summary>
     bool TryGetRegisters(out DebugRegisterFile registers);

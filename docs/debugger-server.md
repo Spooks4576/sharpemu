@@ -96,6 +96,7 @@ number or a `0x`-prefixed hex string.
 | `ping` | — | — |
 | `status` (`info`) | — | `state`, `breakpoints`, `lastStop?` |
 | `state` | — | `state` |
+| `threads` (`list-threads`) | — | live `threads[]` scheduler snapshot |
 | `registers` (`regs`) | — | `registers` (rax..r15, rip, rflags, fs_base, gs_base) |
 | `set-register` | `register`, `value` | — |
 | `read-memory` | `address`, `length` (≤ 65536) | `address`, `length`, `bytes` (hex) |

@@ -75,6 +75,9 @@ public sealed class DebuggerSession : IDebuggerSession, ICpuDebugHook
         }
     }
 
+    public IReadOnlyList<GuestThreadSnapshot> SnapshotThreads() =>
+        GuestThreadExecution.Scheduler?.SnapshotThreads() ?? [];
+
     void ICpuDebugHook.OnFrameEnter(ICpuDebugFrame frame)
     {
         DebugStopEvent? stop;

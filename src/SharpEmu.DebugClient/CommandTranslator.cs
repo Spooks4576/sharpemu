@@ -51,6 +51,8 @@ internal static class CommandTranslator
                 return Request("status");
             case "state":
                 return Request("state");
+            case "threads" or "thread" or "bt":
+                return Request("threads");
             case "regs" or "registers":
                 return Request("registers");
             case "continue" or "cont" or "c":
@@ -140,6 +142,7 @@ internal static class CommandTranslator
         SharpEmu debug client commands:
           status | info            Show target state and last stop
           state                    Show run state only
+          threads | bt             Snapshot guest threads and blocked continuations
           regs | registers         Dump integer registers (paused only)
           setreg <reg> <value>     Set a register (rip/rflags/gp, paused only)
           mem <addr> <len>         Read guest memory as hex (paused only)

@@ -3,6 +3,7 @@
 
 using System.Buffers.Binary;
 using SharpEmu.HLE;
+using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Kernel;
 using Xunit;
 
@@ -70,6 +71,8 @@ public sealed class AgcEventQueueTests
         Assert.Equal(1u, ReadUInt32(memory, eventsAddress + 0x0C));
         Assert.Equal(eventType, ReadUInt64(memory, eventsAddress + 0x10));
         Assert.Equal(userData, ReadUInt64(memory, eventsAddress + 0x18));
+
+        DeleteEqueue(ctx, handle);
     }
 
     [Fact]
@@ -97,6 +100,71 @@ public sealed class AgcEventQueueTests
             0x07);
 
         Assert.Equal(0, triggered);
+
+        DeleteEqueue(ctx, handle);
+    }
+
+    [Fact]
+    public void TriggerSubmittedQueueEvent_RoutesGraphicsAndComputeToTheirOwnIdentifiers()
+    {
+        var memory = new FakeCpuMemory(BaseAddress, MemorySize);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+
+        const ulong handleOutAddress = BaseAddress + 0x100;
+        const ulong eventsAddress = BaseAddress + 0x200;
+        const ulong outCountAddress = BaseAddress + 0x300;
+        const ulong timeoutAddress = BaseAddress + 0x400;
+
+        ctx[CpuRegister.Rdi] = handleOutAddress;
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_OK,
+            KernelEventQueueCompatExports.KernelCreateEqueue(ctx));
+        var handle = ReadUInt64(memory, handleOutAddress);
+
+        Assert.True(KernelEventQueueCompatExports.RegisterEvent(
+            handle,
+            0,
+            KernelEventQueueCompatExports.KernelEventFilterGraphics,
+            0xAAAA));
+        Assert.True(KernelEventQueueCompatExports.RegisterEvent(
+            handle,
+            0x20,
+            KernelEventQueueCompatExports.KernelEventFilterGraphics,
+            0xBBBB));
+
+        Assert.Equal(1, AgcExports.TriggerSubmittedQueueEvent(graphicsQueue: true, eventType: 0x2E));
+
+        WriteUInt64(memory, timeoutAddress, 0);
+        ctx[CpuRegister.Rdi] = handle;
+        ctx[CpuRegister.Rsi] = eventsAddress;
+        ctx[CpuRegister.Rdx] = 1;
+        ctx[CpuRegister.Rcx] = outCountAddress;
+        ctx[CpuRegister.R8] = timeoutAddress;
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_OK,
+            KernelEventQueueCompatExports.KernelWaitEqueue(ctx));
+        Assert.Equal(1u, ReadUInt32(memory, outCountAddress));
+
+        Assert.Equal(0UL, ReadUInt64(memory, eventsAddress + 0x00));
+        Assert.Equal(0xAAAAUL, ReadUInt64(memory, eventsAddress + 0x18));
+
+        Assert.Equal(1, AgcExports.TriggerSubmittedQueueEvent(graphicsQueue: false, eventType: 0x10));
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_OK,
+            KernelEventQueueCompatExports.KernelWaitEqueue(ctx));
+        Assert.Equal(1u, ReadUInt32(memory, outCountAddress));
+        Assert.Equal(0x20UL, ReadUInt64(memory, eventsAddress + 0x00));
+        Assert.Equal(0xBBBBUL, ReadUInt64(memory, eventsAddress + 0x18));
+
+        DeleteEqueue(ctx, handle);
+    }
+
+    private static void DeleteEqueue(CpuContext ctx, ulong handle)
+    {
+        ctx[CpuRegister.Rdi] = handle;
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_OK,
+            KernelEventQueueCompatExports.KernelDeleteEqueue(ctx));
     }
 
     private static ulong ReadUInt64(FakeCpuMemory memory, ulong address)

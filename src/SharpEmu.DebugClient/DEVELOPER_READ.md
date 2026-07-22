@@ -98,6 +98,7 @@ commands only succeed while the target is **paused**.
 | ------- | ----------- | ----------- |
 | `status` \| `info` | `status` | Target state plus the last stop. |
 | `state` | `state` | Run state only (`Running`/`Paused`/…). |
+| `threads` \| `bt` | `threads` | Snapshot guest threads, pthread arguments, wake keys, and blocked continuations. |
 | `regs` \| `registers` | `registers` | Dump the integer registers. |
 | `setreg <reg> <value>` | `set-register` | Set `rip`, `rflags`, or a GP register. |
 | `mem <addr> <len>` \| `read <addr> <len>` | `read-memory` | Read guest memory as hex. |

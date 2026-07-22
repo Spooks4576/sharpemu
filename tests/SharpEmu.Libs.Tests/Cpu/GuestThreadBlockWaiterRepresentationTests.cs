@@ -100,6 +100,26 @@ public sealed class GuestThreadBlockWaiterRepresentationTests
         }
     }
 
+    [Fact]
+    public void ContextBackedBlockWithoutImportContinuationIsRejected()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        var context = new CpuContext(new FakeCpuMemory(memoryBase, 0x1000), Generation.Gen5);
+        var previousThread = GuestThreadExecution.EnterGuestThread(0x5678);
+        try
+        {
+            Assert.False(GuestThreadExecution.RequestCurrentThreadBlock(
+                context,
+                "invalid_wait",
+                "invalid_waiter:1"));
+            Assert.False(GuestThreadExecution.TryConsumeCurrentThreadBlock(out _));
+        }
+        finally
+        {
+            GuestThreadExecution.RestoreGuestThread(previousThread);
+        }
+    }
+
     private static bool IsFuncParameter(Type parameterType)
     {
         var type = parameterType.IsByRef

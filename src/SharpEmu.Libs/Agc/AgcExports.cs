@@ -3079,12 +3079,31 @@ public static partial class AgcExports
         // guest-memory writes have finished. Put the notification on that same
         // logical graphics queue instead of approximating completion with a
         // timer, which can wake Unity while its upload data is still stale.
+        using var guestQueueScope = GuestGpu.Current.EnterGuestQueue(
+            state.QueueName,
+            submissionId);
         if (GuestGpu.Current.SubmitOrderedGuestAction(
-                TriggerCompletionEvents,
-                $"agc submit completion {submissionId}") == 0)
+            TriggerCompletionEvents,
+            $"agc submit completion {submissionId}") == 0)
         {
             TriggerCompletionEvents();
         }
+    }
+
+    // Graphics and compute use distinct interrupt identifiers; EVENT_TYPE is payload.
+    // Keep the filter-only fallback for titles that register another identifier.
+    internal static int TriggerSubmittedQueueEvent(bool graphicsQueue, ulong eventType)
+    {
+        var preferredIdent = graphicsQueue ? 0UL : 0x20UL;
+        var triggered = KernelEventQueueCompatExports.TriggerRegisteredEvents(
+            preferredIdent,
+            KernelEventQueueCompatExports.KernelEventFilterGraphics,
+            eventType);
+        return triggered != 0
+            ? triggered
+            : KernelEventQueueCompatExports.TriggerRegisteredEventsByFilter(
+                KernelEventQueueCompatExports.KernelEventFilterGraphics,
+                eventType);
     }
 
     // Returns true only when parsing stopped on an unsatisfied WAIT_REG_MEM.
@@ -3295,8 +3314,8 @@ public static partial class AgcExports
                     state,
                     () =>
                     {
-                        var triggered = KernelEventQueueCompatExports.TriggerRegisteredEventsByFilter(
-                            KernelEventQueueCompatExports.KernelEventFilterGraphics,
+                        var triggered = TriggerSubmittedQueueEvent(
+                            ReferenceEquals(state, gpuState.Graphics),
                             eventType);
                         if (tracePackets)
                         {
